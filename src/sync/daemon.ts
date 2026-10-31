@@ -13,6 +13,7 @@ import * as Stream from "effect/Stream";
 
 import { StaleWorkspaceGeneration } from "../domain/errors.ts";
 import type {
+    ProjectMode,
     WorkspaceCwdHint,
     WorkspaceGeneration,
     WorkspaceId,
@@ -28,7 +29,7 @@ import { resolveProject } from "./resolve-project.ts";
 
 export interface SuccessfulWorkspaceProject {
     readonly workspaceId: WorkspaceId;
-    readonly gitRoot: string;
+    readonly projectPath: string;
 }
 
 export interface SyncCache {
@@ -36,7 +37,7 @@ export interface SyncCache {
     readonly snapshot: WorkspaceSnapshot | null;
     readonly cwdHints: ReadonlyMap<WorkspaceId, string>;
     readonly projects: ReadonlyMap<WorkspaceId, WorkspaceProject>;
-    readonly ensuredGitRoots: ReadonlySet<string>;
+    readonly ensuredProjectPaths: ReadonlySet<string>;
     readonly lastSuccessful: SuccessfulWorkspaceProject | null;
     readonly lastSynchronizedAt: number | null;
 }
@@ -46,7 +47,7 @@ export const makeEmptySyncCache = (): SyncCache => ({
     snapshot: null,
     cwdHints: new Map(),
     projects: new Map(),
-    ensuredGitRoots: new Set(),
+    ensuredProjectPaths: new Set(),
     lastSuccessful: null,
     lastSynchronizedAt: null,
 });
@@ -100,7 +101,9 @@ const sameSuccessfulProject = (
     left: SuccessfulWorkspaceProject | null,
     right: SuccessfulWorkspaceProject,
 ): boolean =>
-    left !== null && left.workspaceId === right.workspaceId && left.gitRoot === right.gitRoot;
+    left !== null &&
+    left.workspaceId === right.workspaceId &&
+    left.projectPath === right.projectPath;
 
 const gateGeneration = (
     cache: Ref.Ref<SyncCache>,
@@ -170,11 +173,12 @@ const resolveSnapshotProjects = (
     snapshot: WorkspaceSnapshot,
     cwdHints: ReadonlyMap<WorkspaceId, string>,
     ingressAt: bigint,
+    projectMode: ProjectMode,
 ) =>
     Effect.gen(function* () {
         const projects = new Map<WorkspaceId, WorkspaceProject>();
         for (const workspace of snapshot.workspaces) {
-            const result = yield* Effect.either(resolveProject(workspace, cwdHints));
+            const result = yield* Effect.either(resolveProject(workspace, cwdHints, projectMode));
             if (result._tag === "Left") {
                 const now = yield* Clock.currentTimeNanos;
                 yield* logSync("warning", "workspace_sync_skipped", {
@@ -199,8 +203,8 @@ const uniqueProjects = (
     const unique = new Map<string, WorkspaceProject>();
     for (const workspace of snapshot.workspaces) {
         const project = projects.get(workspace.workspaceId);
-        if (project !== undefined && !unique.has(project.gitRoot)) {
-            unique.set(project.gitRoot, project);
+        if (project !== undefined && !unique.has(project.projectPath)) {
+            unique.set(project.projectPath, project);
         }
     }
     return [...unique.values()];
@@ -219,349 +223,365 @@ export interface SyncDaemon {
     readonly toggleEnabled: Effect.Effect<boolean>;
 }
 
-export const makeSyncDaemon = Effect.gen(function* () {
-    const source = yield* WorkspaceSource;
-    const hintSource = yield* WorkspaceHintSource;
-    const adapter = yield* EditorAdapter;
-    const cache = yield* Ref.make(makeEmptySyncCache());
-    const triggers = yield* Queue.unbounded<RefreshTrigger>();
-    const cancellations = new Map<WorkspaceGeneration, Deferred.Deferred<void>>();
-    const initialDisabled = yield* Deferred.make<void>();
-    const control = yield* Ref.make<SyncControlState>({
-        enabled: true,
-        disabled: initialDisabled,
-    });
-    const controlCommands = yield* Effect.makeSemaphore(1);
+export const makeSyncDaemonWithProjectMode = (projectMode: ProjectMode) =>
+    Effect.gen(function* () {
+        const source = yield* WorkspaceSource;
+        const hintSource = yield* WorkspaceHintSource;
+        const adapter = yield* EditorAdapter;
+        const cache = yield* Ref.make(makeEmptySyncCache());
+        const triggers = yield* Queue.unbounded<RefreshTrigger>();
+        const cancellations = new Map<WorkspaceGeneration, Deferred.Deferred<void>>();
+        const initialDisabled = yield* Deferred.make<void>();
+        const control = yield* Ref.make<SyncControlState>({
+            enabled: true,
+            disabled: initialDisabled,
+        });
+        const controlCommands = yield* Effect.makeSemaphore(1);
 
-    const refresh = (trigger: RefreshTrigger, disabled: Deferred.Deferred<void>) =>
-        Effect.gen(function* () {
-            yield* gateSynchronization(cache, control, disabled, trigger.generation);
-            yield* logSync("info", "workspace_sync_started", {
-                operation: "snapshot",
-                elapsedMs: elapsedMillis(trigger.ingressAt, yield* Clock.currentTimeNanos),
-            });
+        const refresh = (trigger: RefreshTrigger, disabled: Deferred.Deferred<void>) =>
+            Effect.gen(function* () {
+                yield* gateSynchronization(cache, control, disabled, trigger.generation);
+                yield* logSync("info", "workspace_sync_started", {
+                    operation: "snapshot",
+                    elapsedMs: elapsedMillis(trigger.ingressAt, yield* Clock.currentTimeNanos),
+                });
 
-            const snapshot = yield* source.snapshot(trigger.generation);
-            yield* gateSynchronization(cache, control, disabled, trigger.generation);
-            const previous = yield* Ref.get(cache);
-            const projects = yield* resolveSnapshotProjects(
-                snapshot,
-                previous.cwdHints,
-                trigger.ingressAt,
-            );
-            yield* gateSynchronization(cache, control, disabled, trigger.generation);
-            const installed = yield* installSnapshot(cache, trigger.generation, snapshot, projects);
-            for (const project of uniqueProjects(snapshot, projects)) {
-                if (installed.ensuredGitRoots.has(project.gitRoot)) {
-                    continue;
+                const snapshot = yield* source.snapshot(trigger.generation);
+                yield* gateSynchronization(cache, control, disabled, trigger.generation);
+                const previous = yield* Ref.get(cache);
+                const projects = yield* resolveSnapshotProjects(
+                    snapshot,
+                    previous.cwdHints,
+                    trigger.ingressAt,
+                    projectMode,
+                );
+                yield* gateSynchronization(cache, control, disabled, trigger.generation);
+                const installed = yield* installSnapshot(
+                    cache,
+                    trigger.generation,
+                    snapshot,
+                    projects,
+                );
+                for (const project of uniqueProjects(snapshot, projects)) {
+                    if (installed.ensuredProjectPaths.has(project.projectPath)) {
+                        continue;
+                    }
+
+                    yield* gateSynchronization(cache, control, disabled, trigger.generation);
+                    const result = yield* Effect.either(adapter.ensureProject(project.projectPath));
+                    yield* gateSynchronization(cache, control, disabled, trigger.generation);
+                    const now = yield* Clock.currentTimeNanos;
+                    if (result._tag === "Left") {
+                        yield* logSync("error", "workspace_sync_failed", {
+                            workspaceId: project.workspaceId,
+                            workspace: project.name,
+                            path: project.projectPath,
+                            operation: "ensure_project",
+                            elapsedMs: elapsedMillis(trigger.ingressAt, now),
+                            cause: result.left,
+                        });
+                        continue;
+                    }
+
+                    const recorded = yield* Ref.modify(cache, (state) => {
+                        if (state.latestLiveGeneration !== trigger.generation) {
+                            return [false, state] as const;
+                        }
+                        const ensuredProjectPaths = new Set(state.ensuredProjectPaths);
+                        ensuredProjectPaths.add(project.projectPath);
+                        return [
+                            true,
+                            {
+                                ...state,
+                                ensuredProjectPaths,
+                                lastSynchronizedAt: Number(now) / 1_000_000,
+                            },
+                        ] as const;
+                    });
+                    if (recorded) {
+                        yield* logSync("info", "workspace_sync_succeeded", {
+                            workspaceId: project.workspaceId,
+                            workspace: project.name,
+                            path: project.projectPath,
+                            operation: "ensure_project",
+                            elapsedMs: elapsedMillis(trigger.ingressAt, now),
+                        });
+                    }
+                }
+
+                const focusedId = snapshot.focusedWorkspaceId;
+                if (focusedId === null) {
+                    return;
+                }
+                const project = projects.get(focusedId);
+                const workspace = findWorkspace(snapshot, focusedId);
+                if (project === undefined || workspace === undefined) {
+                    return;
+                }
+                const successful = {
+                    workspaceId: focusedId,
+                    projectPath: project.projectPath,
+                } satisfies SuccessfulWorkspaceProject;
+                if (sameSuccessfulProject(installed.lastSuccessful, successful)) {
+                    return;
                 }
 
                 yield* gateSynchronization(cache, control, disabled, trigger.generation);
-                const result = yield* Effect.either(adapter.ensureProject(project.gitRoot));
+                const result = yield* Effect.either(adapter.focusProject(project.projectPath));
                 yield* gateSynchronization(cache, control, disabled, trigger.generation);
                 const now = yield* Clock.currentTimeNanos;
                 if (result._tag === "Left") {
                     yield* logSync("error", "workspace_sync_failed", {
-                        workspaceId: project.workspaceId,
-                        workspace: project.name,
-                        path: project.gitRoot,
-                        operation: "ensure_project",
+                        workspaceId: workspace.workspaceId,
+                        workspace: workspace.name,
+                        path: project.projectPath,
+                        operation: "focus_project",
                         elapsedMs: elapsedMillis(trigger.ingressAt, now),
                         cause: result.left,
                     });
-                    continue;
+                    return;
                 }
 
-                const recorded = yield* Ref.modify(cache, (state) => {
-                    if (state.latestLiveGeneration !== trigger.generation) {
-                        return [false, state] as const;
-                    }
-                    const ensuredGitRoots = new Set(state.ensuredGitRoots);
-                    ensuredGitRoots.add(project.gitRoot);
-                    return [
-                        true,
-                        {
-                            ...state,
-                            ensuredGitRoots,
-                            lastSynchronizedAt: Number(now) / 1_000_000,
-                        },
-                    ] as const;
-                });
+                const recorded = yield* Ref.modify(cache, (state) =>
+                    state.latestLiveGeneration === trigger.generation
+                        ? [
+                              true,
+                              {
+                                  ...state,
+                                  lastSuccessful: successful,
+                                  lastSynchronizedAt: Number(now) / 1_000_000,
+                              },
+                          ]
+                        : [false, state],
+                );
                 if (recorded) {
                     yield* logSync("info", "workspace_sync_succeeded", {
-                        workspaceId: project.workspaceId,
-                        workspace: project.name,
-                        path: project.gitRoot,
-                        operation: "ensure_project",
+                        workspaceId: workspace.workspaceId,
+                        workspace: workspace.name,
+                        path: project.projectPath,
+                        operation: "focus_project",
                         elapsedMs: elapsedMillis(trigger.ingressAt, now),
                     });
                 }
-            }
-
-            const focusedId = snapshot.focusedWorkspaceId;
-            if (focusedId === null) {
-                return;
-            }
-            const project = projects.get(focusedId);
-            const workspace = findWorkspace(snapshot, focusedId);
-            if (project === undefined || workspace === undefined) {
-                return;
-            }
-            const successful = {
-                workspaceId: focusedId,
-                gitRoot: project.gitRoot,
-            } satisfies SuccessfulWorkspaceProject;
-            if (sameSuccessfulProject(installed.lastSuccessful, successful)) {
-                return;
-            }
-
-            yield* gateSynchronization(cache, control, disabled, trigger.generation);
-            const result = yield* Effect.either(adapter.focusProject(project.gitRoot));
-            yield* gateSynchronization(cache, control, disabled, trigger.generation);
-            const now = yield* Clock.currentTimeNanos;
-            if (result._tag === "Left") {
-                yield* logSync("error", "workspace_sync_failed", {
-                    workspaceId: workspace.workspaceId,
-                    workspace: workspace.name,
-                    path: project.gitRoot,
-                    operation: "focus_project",
-                    elapsedMs: elapsedMillis(trigger.ingressAt, now),
-                    cause: result.left,
-                });
-                return;
-            }
-
-            const recorded = yield* Ref.modify(cache, (state) =>
-                state.latestLiveGeneration === trigger.generation
-                    ? [
-                          true,
-                          {
-                              ...state,
-                              lastSuccessful: successful,
-                              lastSynchronizedAt: Number(now) / 1_000_000,
-                          },
-                      ]
-                    : [false, state],
-            );
-            if (recorded) {
-                yield* logSync("info", "workspace_sync_succeeded", {
-                    workspaceId: workspace.workspaceId,
-                    workspace: workspace.name,
-                    path: project.gitRoot,
-                    operation: "focus_project",
-                    elapsedMs: elapsedMillis(trigger.ingressAt, now),
-                });
-            }
-        }).pipe(
-            Effect.catchTag("StaleWorkspaceGeneration", () => Effect.void),
-            Effect.catchTag("SynchronizationDisabled", () => Effect.void),
-            Effect.catchAllCause((cause) =>
-                Clock.currentTimeNanos.pipe(
-                    Effect.flatMap((now) =>
-                        logSync("error", "workspace_sync_failed", {
-                            operation: "snapshot",
-                            elapsedMs: elapsedMillis(trigger.ingressAt, now),
-                            cause,
-                        }),
-                    ),
-                ),
-            ),
-        );
-
-    const worker = Effect.forever(
-        Effect.gen(function* () {
-            const first = yield* Queue.take(triggers);
-            yield* Clock.sleep("50 millis");
-            const queued = yield* Queue.takeAll(triggers);
-            const burst = [first, ...Chunk.toReadonlyArray(queued)];
-            const state = yield* Ref.get(cache);
-            const liveGeneration = state.latestLiveGeneration;
-            if (liveGeneration === null) {
-                return;
-            }
-            const matching = burst.filter((trigger) => trigger.generation === liveGeneration);
-            if (matching.length === 0) {
-                return;
-            }
-            const controlState = yield* Ref.get(control);
-            if (!controlState.enabled) {
-                return;
-            }
-            const trigger = matching.reduce((earliest, candidate) =>
-                candidate.ingressAt < earliest.ingressAt ? candidate : earliest,
-            );
-            const cancelled = Deferred.await(trigger.cancelled).pipe(
-                Effect.flatMap(() =>
-                    Effect.fail(new StaleWorkspaceGeneration({ generation: trigger.generation })),
-                ),
-            );
-            const disabled = Deferred.await(controlState.disabled).pipe(
-                Effect.flatMap(() => Effect.fail(synchronizationDisabled)),
-            );
-            yield* Effect.raceFirst(
-                Effect.raceFirst(refresh(trigger, controlState.disabled), cancelled),
-                disabled,
-            ).pipe(
+            }).pipe(
                 Effect.catchTag("StaleWorkspaceGeneration", () => Effect.void),
                 Effect.catchTag("SynchronizationDisabled", () => Effect.void),
+                Effect.catchAllCause((cause) =>
+                    Clock.currentTimeNanos.pipe(
+                        Effect.flatMap((now) =>
+                            logSync("error", "workspace_sync_failed", {
+                                operation: "snapshot",
+                                elapsedMs: elapsedMillis(trigger.ingressAt, now),
+                                cause,
+                            }),
+                        ),
+                    ),
+                ),
             );
-        }),
-    );
 
-    const removeQueuedGeneration = (generation: WorkspaceGeneration) =>
-        Effect.gen(function* () {
-            const queued = yield* Queue.takeAll(triggers);
-            yield* Effect.forEach(queued, (trigger) =>
-                trigger.generation === generation ? Effect.void : Queue.offer(triggers, trigger),
-            );
-        });
-
-    const onSourceEvent = (event: WorkspaceSourceEvent) =>
-        Effect.gen(function* () {
-            if (event._tag === "Disconnected") {
-                const cancelled = cancellations.get(event.generation);
-                if (cancelled !== undefined) {
-                    yield* Deferred.succeed(cancelled, undefined);
-                    cancellations.delete(event.generation);
+        const worker = Effect.forever(
+            Effect.gen(function* () {
+                const first = yield* Queue.take(triggers);
+                yield* Clock.sleep("50 millis");
+                const queued = yield* Queue.takeAll(triggers);
+                const burst = [first, ...Chunk.toReadonlyArray(queued)];
+                const state = yield* Ref.get(cache);
+                const liveGeneration = state.latestLiveGeneration;
+                if (liveGeneration === null) {
+                    return;
                 }
-                yield* Ref.update(cache, (state) =>
-                    state.latestLiveGeneration === event.generation
-                        ? { ...state, latestLiveGeneration: null }
-                        : state,
+                const matching = burst.filter((trigger) => trigger.generation === liveGeneration);
+                if (matching.length === 0) {
+                    return;
+                }
+                const controlState = yield* Ref.get(control);
+                if (!controlState.enabled) {
+                    return;
+                }
+                const trigger = matching.reduce((earliest, candidate) =>
+                    candidate.ingressAt < earliest.ingressAt ? candidate : earliest,
                 );
-                yield* removeQueuedGeneration(event.generation);
-                return;
-            }
+                const cancelled = Deferred.await(trigger.cancelled).pipe(
+                    Effect.flatMap(() =>
+                        Effect.fail(
+                            new StaleWorkspaceGeneration({ generation: trigger.generation }),
+                        ),
+                    ),
+                );
+                const disabled = Deferred.await(controlState.disabled).pipe(
+                    Effect.flatMap(() => Effect.fail(synchronizationDisabled)),
+                );
+                yield* Effect.raceFirst(
+                    Effect.raceFirst(refresh(trigger, controlState.disabled), cancelled),
+                    disabled,
+                ).pipe(
+                    Effect.catchTag("StaleWorkspaceGeneration", () => Effect.void),
+                    Effect.catchTag("SynchronizationDisabled", () => Effect.void),
+                );
+            }),
+        );
 
-            const current = yield* Ref.get(cache);
-            if (
-                current.latestLiveGeneration !== null &&
-                event.generation < current.latestLiveGeneration
-            ) {
-                return;
-            }
-            if (
-                current.latestLiveGeneration !== null &&
-                event.generation > current.latestLiveGeneration
-            ) {
-                for (const [generation, cancelled] of cancellations) {
-                    if (generation < event.generation) {
+        const removeQueuedGeneration = (generation: WorkspaceGeneration) =>
+            Effect.gen(function* () {
+                const queued = yield* Queue.takeAll(triggers);
+                yield* Effect.forEach(queued, (trigger) =>
+                    trigger.generation === generation
+                        ? Effect.void
+                        : Queue.offer(triggers, trigger),
+                );
+            });
+
+        const onSourceEvent = (event: WorkspaceSourceEvent) =>
+            Effect.gen(function* () {
+                if (event._tag === "Disconnected") {
+                    const cancelled = cancellations.get(event.generation);
+                    if (cancelled !== undefined) {
                         yield* Deferred.succeed(cancelled, undefined);
-                        cancellations.delete(generation);
+                        cancellations.delete(event.generation);
+                    }
+                    yield* Ref.update(cache, (state) =>
+                        state.latestLiveGeneration === event.generation
+                            ? { ...state, latestLiveGeneration: null }
+                            : state,
+                    );
+                    yield* removeQueuedGeneration(event.generation);
+                    return;
+                }
+
+                const current = yield* Ref.get(cache);
+                if (
+                    current.latestLiveGeneration !== null &&
+                    event.generation < current.latestLiveGeneration
+                ) {
+                    return;
+                }
+                if (
+                    current.latestLiveGeneration !== null &&
+                    event.generation > current.latestLiveGeneration
+                ) {
+                    for (const [generation, cancelled] of cancellations) {
+                        if (generation < event.generation) {
+                            yield* Deferred.succeed(cancelled, undefined);
+                            cancellations.delete(generation);
+                        }
                     }
                 }
+
+                let cancelled = cancellations.get(event.generation);
+                if (cancelled === undefined) {
+                    cancelled = yield* Deferred.make<void>();
+                    cancellations.set(event.generation, cancelled);
+                }
+                yield* Ref.update(cache, (state) => {
+                    const generationChanged = state.latestLiveGeneration !== event.generation;
+                    return {
+                        ...state,
+                        latestLiveGeneration: event.generation,
+                        ensuredProjectPaths: generationChanged
+                            ? new Set<string>()
+                            : state.ensuredProjectPaths,
+                        lastSuccessful: generationChanged ? null : state.lastSuccessful,
+                    };
+                });
+                if (!(yield* Ref.get(control)).enabled) {
+                    return;
+                }
+                yield* Queue.offer(triggers, {
+                    generation: event.generation,
+                    ingressAt: yield* Clock.currentTimeNanos,
+                    cancelled,
+                });
+            });
+
+        const onHint = (hint: WorkspaceCwdHint) =>
+            Effect.gen(function* () {
+                const state = yield* Ref.modify(cache, (current) => {
+                    const cwdHints = new Map(current.cwdHints);
+                    cwdHints.set(hint.workspaceId, hint.cwd);
+                    const next = { ...current, cwdHints };
+                    return [next, next] as const;
+                });
+                const generation = state.latestLiveGeneration;
+                if (generation === null) {
+                    return;
+                }
+                const cancelled = cancellations.get(generation);
+                if (cancelled === undefined) {
+                    return;
+                }
+                if (!(yield* Ref.get(control)).enabled) {
+                    return;
+                }
+                yield* Queue.offer(triggers, {
+                    generation,
+                    ingressAt: yield* Clock.currentTimeNanos,
+                    cancelled,
+                });
+            });
+
+        const toggleEnabled = Effect.gen(function* () {
+            const nextDisabled = yield* Deferred.make<void>();
+            const transition = yield* Ref.modify(control, (state) =>
+                state.enabled
+                    ? [
+                          { enabled: false, disabled: state.disabled },
+                          { ...state, enabled: false },
+                      ]
+                    : [
+                          { enabled: true, disabled: state.disabled },
+                          { enabled: true, disabled: nextDisabled },
+                      ],
+            );
+
+            if (!transition.enabled) {
+                yield* Deferred.succeed(transition.disabled, undefined);
+                yield* Queue.takeAll(triggers);
+                return false;
             }
 
-            let cancelled = cancellations.get(event.generation);
-            if (cancelled === undefined) {
-                cancelled = yield* Deferred.make<void>();
-                cancellations.set(event.generation, cancelled);
-            }
-            yield* Ref.update(cache, (state) => {
-                const generationChanged = state.latestLiveGeneration !== event.generation;
-                return {
-                    ...state,
-                    latestLiveGeneration: event.generation,
-                    ensuredGitRoots: generationChanged ? new Set<string>() : state.ensuredGitRoots,
-                    lastSuccessful: generationChanged ? null : state.lastSuccessful,
-                };
-            });
-            if (!(yield* Ref.get(control)).enabled) {
-                return;
-            }
-            yield* Queue.offer(triggers, {
-                generation: event.generation,
-                ingressAt: yield* Clock.currentTimeNanos,
-                cancelled,
-            });
-        });
-
-    const onHint = (hint: WorkspaceCwdHint) =>
-        Effect.gen(function* () {
             const state = yield* Ref.modify(cache, (current) => {
-                const cwdHints = new Map(current.cwdHints);
-                cwdHints.set(hint.workspaceId, hint.cwd);
-                const next = { ...current, cwdHints };
+                const next = {
+                    ...current,
+                    ensuredProjectPaths: new Set<string>(),
+                    lastSuccessful: null,
+                };
                 return [next, next] as const;
             });
             const generation = state.latestLiveGeneration;
             if (generation === null) {
-                return;
+                return true;
             }
             const cancelled = cancellations.get(generation);
             if (cancelled === undefined) {
-                return;
-            }
-            if (!(yield* Ref.get(control)).enabled) {
-                return;
+                return true;
             }
             yield* Queue.offer(triggers, {
                 generation,
                 ingressAt: yield* Clock.currentTimeNanos,
                 cancelled,
             });
-        });
+            return true;
+        }).pipe(controlCommands.withPermits(1));
 
-    const toggleEnabled = Effect.gen(function* () {
-        const nextDisabled = yield* Deferred.make<void>();
-        const transition = yield* Ref.modify(control, (state) =>
-            state.enabled
-                ? [
-                      { enabled: false, disabled: state.disabled },
-                      { ...state, enabled: false },
-                  ]
-                : [
-                      { enabled: true, disabled: state.disabled },
-                      { enabled: true, disabled: nextDisabled },
-                  ],
+        const enabled = Ref.get(control).pipe(Effect.map((state) => state.enabled));
+
+        const ingress = Stream.merge(
+            source.events.pipe(Stream.map((event): Ingress => ({ _tag: "SourceEvent", event }))),
+            hintSource.hints.pipe(Stream.map((hint): Ingress => ({ _tag: "CwdHint", hint }))),
         );
+        const collector = Stream.runForEach(ingress, (item) =>
+            item._tag === "SourceEvent" ? onSourceEvent(item.event) : onHint(item.hint),
+        ).pipe(Effect.zipRight(Effect.never));
 
-        if (!transition.enabled) {
-            yield* Deferred.succeed(transition.disabled, undefined);
-            yield* Queue.takeAll(triggers);
-            return false;
-        }
-
-        const state = yield* Ref.modify(cache, (current) => {
-            const next = {
-                ...current,
-                ensuredGitRoots: new Set<string>(),
-                lastSuccessful: null,
-            };
-            return [next, next] as const;
+        const run = Effect.gen(function* () {
+            yield* Effect.addFinalizer(() => Queue.shutdown(triggers));
+            const collectorFiber = yield* Effect.forkScoped(collector);
+            const workerFiber = yield* Effect.forkScoped(worker);
+            return yield* Effect.raceFirst(Fiber.join(collectorFiber), Fiber.join(workerFiber));
         });
-        const generation = state.latestLiveGeneration;
-        if (generation === null) {
-            return true;
-        }
-        const cancelled = cancellations.get(generation);
-        if (cancelled === undefined) {
-            return true;
-        }
-        yield* Queue.offer(triggers, {
-            generation,
-            ingressAt: yield* Clock.currentTimeNanos,
-            cancelled,
-        });
-        return true;
-    }).pipe(controlCommands.withPermits(1));
 
-    const enabled = Ref.get(control).pipe(Effect.map((state) => state.enabled));
-
-    const ingress = Stream.merge(
-        source.events.pipe(Stream.map((event): Ingress => ({ _tag: "SourceEvent", event }))),
-        hintSource.hints.pipe(Stream.map((hint): Ingress => ({ _tag: "CwdHint", hint }))),
-    );
-    const collector = Stream.runForEach(ingress, (item) =>
-        item._tag === "SourceEvent" ? onSourceEvent(item.event) : onHint(item.hint),
-    ).pipe(Effect.zipRight(Effect.never));
-
-    const run = Effect.gen(function* () {
-        yield* Effect.addFinalizer(() => Queue.shutdown(triggers));
-        const collectorFiber = yield* Effect.forkScoped(collector);
-        const workerFiber = yield* Effect.forkScoped(worker);
-        return yield* Effect.raceFirst(Fiber.join(collectorFiber), Fiber.join(workerFiber));
+        return { cache, enabled, run, toggleEnabled } satisfies SyncDaemon;
     });
 
-    return { cache, enabled, run, toggleEnabled } satisfies SyncDaemon;
-});
+/** The default daemon resolves each workspace to its canonical Git root. */
+export const makeSyncDaemon = makeSyncDaemonWithProjectMode("git-root");

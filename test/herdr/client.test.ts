@@ -226,7 +226,9 @@ const makeServer = async (): Promise<ServerHarness> => {
     const requests = new AsyncQueue<ReceivedRequest>();
     const closed = new AsyncQueue<ServerConnection>();
     const listener = Bun.listen<ServerConnection>({
-        unix: path,
+        // HerdR serves Windows clients through a named pipe named after the socket path, so the
+        // fake peer has to bind the same namespace the transport connects to.
+        unix: process.platform === "win32" ? `\\\\.\\pipe\\${path}` : path,
         socket: {
             open(socket) {
                 socket.data = { buffer: "", decoder: new TextDecoder(), request: undefined };
@@ -265,17 +267,20 @@ const makeServer = async (): Promise<ServerHarness> => {
 
 test("resolveHerdRSocketPath gives HERDR_SOCKET_PATH precedence over named and default sessions", () => {
     expect(
-        resolveHerdRSocketPath({
-            HERDR_SOCKET_PATH: "/override/herdr.sock",
-            HERDR_SESSION: "named",
-            HOME: "/home/artisan",
-            XDG_CONFIG_HOME: "/config",
-        }),
+        resolveHerdRSocketPath(
+            {
+                HERDR_SOCKET_PATH: "/override/herdr.sock",
+                HERDR_SESSION: "named",
+                HOME: "/home/artisan",
+                XDG_CONFIG_HOME: "/config",
+            },
+            "linux",
+        ),
     ).toBe("/override/herdr.sock");
-    expect(resolveHerdRSocketPath({ HERDR_SESSION: "named", XDG_CONFIG_HOME: "/config" })).toBe(
-        "/config/herdr/sessions/named/herdr.sock",
-    );
-    expect(resolveHerdRSocketPath({ HOME: "/home/artisan" })).toBe(
+    expect(
+        resolveHerdRSocketPath({ HERDR_SESSION: "named", XDG_CONFIG_HOME: "/config" }, "linux"),
+    ).toBe("/config/herdr/sessions/named/herdr.sock");
+    expect(resolveHerdRSocketPath({ HOME: "/home/artisan" }, "linux")).toBe(
         "/home/artisan/.config/herdr/herdr.sock",
     );
 });
@@ -491,8 +496,8 @@ test("ignores malformed, pre-ack, and unknown events without dropping known even
             expect(await fifth).toBe("timeout");
         });
     } finally {
-        await server.close();
         vi.useRealTimers();
+        await server.close();
     }
 });
 
@@ -915,7 +920,7 @@ test("daemon cancels blocked N S2 on disconnect and accepts only N+1 S2", async 
                 ]);
                 const cache = yield* Ref.get(harness.daemon.cache);
                 expect(cache.latestLiveGeneration).toBe(generation(2));
-                expect(cache.lastSuccessful?.gitRoot).toBe(repositoryRoot);
+                expect(cache.lastSuccessful?.projectPath).toBe(repositoryRoot);
             }),
         );
     } finally {

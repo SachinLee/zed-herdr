@@ -70,52 +70,7 @@ See [Runtime composition](runtime.md), [HerdR workspace source](herdr.md),
 
 ## Plugin hook flow
 
-Hook startup first attempts reuse. Only control unavailability enters the locked contender branch,
-and any pane opened by the plugin is explicitly unfocused.
-
-```mermaid
-sequenceDiagram
-    participant Hook as plugin hook
-    participant Directory as control directory
-    participant Control as control socket
-    participant Lock as token lock
-    participant HerdR as HerdR plugin pane
-    participant Daemon as daemon control server
-    participant Queue as notification queue
-    participant Hints as WorkspaceHintSource
-    participant Sync as SyncDaemon
-
-    Hook->>Hook: decode hook
-    Hook->>Directory: validate owner and mode
-    Hook->>Control: notify workspace cwd
-    alt existing daemon
-        Control->>Queue: publish notification
-        Queue->>Hints: stream WorkspaceCwdHint
-        Hints->>Sync: current-generation refresh
-        Control-->>Hook: ok
-    else ControlUnavailable
-        Control-->>Hook: unavailable
-        Hook->>Lock: acquire
-        Hook->>Control: re-notify under lock
-        alt concurrent winner now available
-            Control->>Queue: publish notification
-            Queue->>Hints: stream WorkspaceCwdHint
-            Hints->>Sync: current-generation refresh
-            Control-->>Hook: ok
-        else still unavailable
-            Control-->>Hook: unavailable
-            Hook->>Control: prepare owner-only socket
-            Hook->>HerdR: open daemon pane --no-focus
-            HerdR->>Daemon: start bun daemon
-            Daemon->>Control: bind and become ready
-            Hook->>Control: notify after readiness
-            Control->>Queue: publish notification
-            Queue->>Hints: stream WorkspaceCwdHint
-            Hints->>Sync: current-generation refresh
-            Control-->>Hook: ok
-        end
-    end
-```
+Hook startup first probes health. Only control unavailability enters the token-locked contender branch. The winner starts a detached daemon after preparing its bounded log; once health succeeds, the hook publishes its cwd hint. Concurrent hooks and explicit `start` reuse the same daemon. `stop` requests scoped cleanup through the validated control endpoint.
 
 See [Plugin lifecycle and control](plugin.md), [Runtime composition](runtime.md),
 [Service ports](services.md), and [Synchronization core](synchronization.md).

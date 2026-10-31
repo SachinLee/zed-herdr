@@ -8,7 +8,7 @@ import { Path } from "@effect/platform/Path";
 
 import { WorkspaceResolutionError } from "../domain/errors.ts";
 import { WorkspaceProject } from "../domain/workspace.ts";
-import type { WorkspaceId, WorkspaceRecord } from "../domain/workspace.ts";
+import type { WorkspaceId, WorkspaceRecord, ProjectMode } from "../domain/workspace.ts";
 
 export type WorkspaceCwdHints = ReadonlyMap<WorkspaceId, string>;
 
@@ -69,6 +69,7 @@ const resolveGitRoot = (candidate: string, workspace: WorkspaceRecord) =>
 export const resolveProject = (
     workspace: WorkspaceRecord,
     cwdHints: WorkspaceCwdHints,
+    projectMode: ProjectMode = "git-root",
 ): Effect.Effect<WorkspaceProject, WorkspaceResolutionError, FileSystem | Path | CommandExecutor> =>
     Effect.gen(function* () {
         const fileSystem = yield* FileSystem;
@@ -102,12 +103,23 @@ export const resolveProject = (
             );
         }
 
+        if (projectMode === "directory") {
+            return WorkspaceProject.make({
+                workspaceId: workspace.workspaceId,
+                name: workspace.name,
+                cwd: candidate,
+                projectPath: candidate,
+                source,
+                isLinkedWorktree: workspace.isLinkedWorktree,
+            });
+        }
+
         const gitRoot = path.resolve(yield* resolveGitRoot(candidate, workspace));
         return WorkspaceProject.make({
             workspaceId: workspace.workspaceId,
             name: workspace.name,
             cwd: candidate,
-            gitRoot,
+            projectPath: gitRoot,
             source,
             isLinkedWorktree: workspace.isLinkedWorktree,
         });

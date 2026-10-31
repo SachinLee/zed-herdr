@@ -28,15 +28,31 @@ export const ToggleControlRequest = Schema.Struct({
 });
 export type ToggleControlRequest = Schema.Schema.Type<typeof ToggleControlRequest>;
 
+export const DaemonIdentity = Schema.Literal("artisann.zed-herdr:daemon");
+export type DaemonIdentity = Schema.Schema.Type<typeof DaemonIdentity>;
+
+/**
+ * A stop names the exact daemon instance it means. The three identity fields are
+ * the ones a health call can observe; a request that does not match the live
+ * process is refused instead of stopping a daemon the caller never saw.
+ */
+export const StopControlRequest = Schema.Struct({
+    type: Schema.Literal("stop"),
+    daemon: Schema.Struct({
+        identity: DaemonIdentity,
+        pid: ProcessId,
+        startedAt: IsoTimestamp,
+    }),
+});
+export type StopControlRequest = Schema.Schema.Type<typeof StopControlRequest>;
+
 export const ControlRequest = Schema.Union(
     NotifyControlRequest,
     HealthControlRequest,
     ToggleControlRequest,
+    StopControlRequest,
 );
 export type ControlRequest = Schema.Schema.Type<typeof ControlRequest>;
-
-export const DaemonIdentity = Schema.Literal("artisann.zed-herdr:daemon");
-export type DaemonIdentity = Schema.Schema.Type<typeof DaemonIdentity>;
 
 /** The daemon-owned fields reported to a local health client. */
 export const DaemonHealth = Schema.Struct({
@@ -67,6 +83,18 @@ export const ToggleControlResponse = Schema.Struct({
 });
 export type ToggleControlResponse = Schema.Schema.Type<typeof ToggleControlResponse>;
 
+/**
+ * A stop acknowledgement is distinct from a health report on the wire: the
+ * `stopping` marker makes the two shapes mutually exclusive so a client can
+ * never accept one while waiting for the other.
+ */
+export const StopControlResponse = Schema.Struct({
+    ok: Schema.Literal(true),
+    stopping: Schema.Literal(true),
+    daemon: DaemonHealth,
+});
+export type StopControlResponse = Schema.Schema.Type<typeof StopControlResponse>;
+
 /** Exact failure wire response: client input failures or server publish failure. */
 export const ControlFailureResponse = Schema.Struct({
     ok: Schema.Literal(false),
@@ -75,6 +103,10 @@ export const ControlFailureResponse = Schema.Struct({
 export type ControlFailureResponse = Schema.Schema.Type<typeof ControlFailureResponse>;
 
 export const ControlResponse = Schema.Union(
+    // The stop acknowledgement must be tried first: it is the only success shape
+    // carrying `stopping`, and a tolerant struct would otherwise strip it into a
+    // plain health report.
+    StopControlResponse,
     HealthControlResponse,
     ToggleControlResponse,
     NotifyControlResponse,

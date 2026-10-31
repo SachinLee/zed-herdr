@@ -1,0 +1,34 @@
+- D:\my-works\herdr-plugin\zed-herdr\openspec\changes\background-daemon-lifecycle\proposal.md — 已接受的后台运行、显式 start/stop、有界日志及更新范围。
+- D:\my-works\herdr-plugin\zed-herdr\openspec\changes\background-daemon-lifecycle\specs\daemon-lifecycle\spec.md — 九项 Requirement 与全部场景的规范原文；没有预设 AC 编号。
+- D:\my-works\herdr-plugin\zed-herdr\openspec\changes\background-daemon-lifecycle\design.md — D1—D6 决策、状态顺序、安全边界、回滚与风险。
+- D:\my-works\herdr-plugin\zed-herdr\openspec\changes\background-daemon-lifecycle\tasks.md — 唯一实施 frontier、RED/GREEN 与逐切片内联分派包。
+- D:\my-works\herdr-plugin\zed-herdr\openspec\config.yaml — OpenSpec artifact 约束；保留工具解析所需英文标题与标识符。
+- D:\my-works\herdr-plugin\zed-herdr\AGENTS.md — Bun、Effect、socket/lock、generation、日志和验证规则；旧 POSIX/pane 描述按已授权现状解读。
+- D:\my-works\herdr-plugin\zed-herdr\CLAUDE.md — 转引仓库 AGENTS.md，无额外规则。
+- D:\my-works\herdr-plugin\zed-herdr\package.json — 依赖、build/typecheck/lint/check 与前台开发脚本的权威定义。
+- D:\my-works\herdr-plugin\zed-herdr\tsconfig.json — strict/noEmit、Bun types、显式 .ts imports 的编译边界。
+- D:\my-works\herdr-plugin\zed-herdr\index.ts — 唯一源码/构建 entry，BunRuntime.runMain 与 pretty logger 设置。
+- D:\my-works\herdr-plugin\zed-herdr\src\cli.ts — 精确单命令 dispatch、4,096 字符错误与 health 身份校验。
+- D:\my-works\herdr-plugin\zed-herdr\src\app.ts — queue/control/source/logger 的 scope 与 Promise/Effect 桥接；停止清理和日志后端改动点。
+- D:\my-works\herdr-plugin\zed-herdr\src\config.ts — 当前默认 directory，后台进程必须继承 Zed 与模式配置。
+- D:\my-works\herdr-plugin\zed-herdr\src\plugin\hook.ts — 原 token 锁、单一 readiness deadline、payload 优先级及 pane 替换接缝。
+- D:\my-works\herdr-plugin\zed-herdr\src\plugin\control.ts — owner/inode/SID 校验、exact-response、单帧 NDJSON 与端点 finalizer。
+- D:\my-works\herdr-plugin\zed-herdr\src\plugin\protocol.ts — bounded Schema、daemon health 与控制请求/响应 union。
+- D:\my-works\herdr-plugin\zed-herdr\src\plugin\windows-pipe.ts — SID/默认 DACL/独立 owner handle 的既有信任模型及 Windows state-root 路径；worker 仅在安全差异时新读。
+- D:\my-works\herdr-plugin\zed-herdr\src\plugin\windows-lock.ts — 保留既有 Windows token/file-identity 算法；规划不修改，worker 仅在锁差异时新读。
+- D:\my-works\herdr-plugin\zed-herdr\src\herdr\client.ts — source scoped finalizer 必须在控制端点关闭前完成；保持 S1/ack/S2。
+- D:\my-works\herdr-plugin\zed-herdr\src\sync\daemon.ts — generation/cycle 与 scoped fibers 保持不动；生命周期通过外层 scope 中断。
+- D:\my-works\herdr-plugin\zed-herdr\herdr-plugin.toml — 保留 Windows 平台、两个事件和 toggle，只移除 daemon pane。
+- D:\my-works\herdr-plugin\zed-herdr\test\plugin\hook-unit.test.ts — 实际 hook 测试入口；二十 contender、注入时间、finally 清锁与 manifest fixture。
+- D:\my-works\herdr-plugin\zed-herdr\test\plugin\control.test.ts — CLI 观测、真实控制端点、hook readiness/通知缓存集成模式。
+- D:\my-works\herdr-plugin\zed-herdr\test\plugin\control-socket.test.ts — POSIX replacement/symlink 保护和共享 framing/response 回归；T1 在对应 seam 添加 stop。
+- D:\my-works\herdr-plugin\zed-herdr\test\plugin\windows-control.test.ts — pipe health/toggle/notify/framing 与 startup readiness；T1 扩展 stop 并保留原场景。
+- D:\my-works\herdr-plugin\zed-herdr\test\plugin\windows-security.test.ts — owner/SID 拒绝策略及原可信本机假设；T1 扩展 stop 前置验证。
+- D:\my-works\herdr-plugin\zed-herdr\test\e2e\daemon.test.ts — built entry、真实子进程、HerdR/Zed peers、跨平台 fixture 与 directory 回归。
+- D:\my-works\herdr-plugin\zed-herdr\README.md — 后台操作、有界日志、无 pane health 和更新/移除顺序的操作入口。
+- D:\my-works\herdr-plugin\zed-herdr\docs\plugin.md — 已有协议与 Windows/POSIX 安全说明，局部同步生命周期。
+- D:\my-works\herdr-plugin\zed-herdr\docs\runtime.md — CLI 集合和运行时 scope/logger 的对应文档。
+- D:\my-works\herdr-plugin\zed-herdr\docs\architecture.md — hook 启动时序图中 pane 边需要替换。
+- D:\my-works\herdr-plugin\zed-herdr\node_modules\bun-types\bun.d.ts — 已定位 detached/windowsHide/unref 类型；不修改依赖文件。
+- D:\my-works\herdr-plugin\zed-herdr\node_modules\effect\src\Logger.ts — jsonLogger/map/replace 支持复用 JSON 编码的文件后端；不修改依赖文件。
+- C:\Users\shuan\.agents\skills\project-standards\references\common.md — 唯一选用的 skill 参考；判定后的规则已内联到切片，worker 不必重读。

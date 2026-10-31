@@ -1,0 +1,58 @@
+{
+    "root": "C:\\Users\\shuan\\AppData\\Local\\Temp\\zh-real-herdr-Wjqc68",
+    "version": "herdr 0.9.5",
+    "steps": [
+        {
+            "step": "isolated install",
+            "code": 0
+        },
+        {
+            "step": "disable",
+            "code": 0
+        },
+        {
+            "step": "stop",
+            "code": 0
+        },
+        {
+            "step": "build",
+            "code": 0,
+            "builtAt": 1793421735828
+        },
+        {
+            "step": "enable",
+            "code": 0
+        },
+        {
+            "step": "start",
+            "code": 0
+        }
+    ],
+    "status": "status: running\nversion: 0.9.5\nendpoint_compatible: yes\nprivate_protocol: 22\nprivate_protocol_compatible: yes\nsocket: C:\\Users\\shuan\\AppData\\Local\\Temp\\zh-real-herdr-Wjqc68\\herdr.sock\n",
+    "configDir": "C:\\Users\\shuan\\AppData\\Local\\Temp\\zh-real-herdr-Wjqc68\\settings\\herdr\\plugins\\config\\artisann.zed-herdr",
+    "panesBefore": "{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[{\"agent_status\":\"unknown\",\"cwd\":\"C:\\\\Users\\\\shuan\\\\\",\"focused\":true,\"pane_id\":\"w1:p1\",\"revision\":0,\"scroll\":{\"max_offset_from_bottom\":0,\"offset_from_bottom\":0,\"viewport_rows\":40},\"tab_id\":\"w1:t1\",\"terminal_id\":\"term_65f1b896742741\",\"workspace_id\":\"w1\"}],\"type\":\"pane_list\"}}\n",
+    "initial": {
+        "identity": "artisann.zed-herdr:daemon",
+        "paneId": null,
+        "pid": 24096,
+        "startedAt": "2026-10-31T04:42:14.899Z",
+        "protocol": null,
+        "beyondTested": false
+    },
+    "current": {
+        "identity": "artisann.zed-herdr:daemon",
+        "paneId": null,
+        "pid": 10780,
+        "startedAt": "2026-10-31T04:42:16.307Z",
+        "protocol": 22,
+        "beyondTested": false
+    },
+    "panes": "{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[{\"agent_status\":\"unknown\",\"cwd\":\"C:\\\\Users\\\\shuan\",\"focused\":true,\"pane_id\":\"w1:p1\",\"revision\":0,\"scroll\":{\"max_offset_from_bottom\":0,\"offset_from_bottom\":0,\"viewport_rows\":40},\"tab_id\":\"w1:t1\",\"terminal_id\":\"term_65f1b896742741\",\"workspace_id\":\"w1\"}],\"type\":\"pane_list\"}}\n",
+    "finalStatus": "status: running\nversion: 0.9.5\nendpoint_compatible: yes\nprivate_protocol: 22\nprivate_protocol_compatible: yes\nsocket: C:\\Users\\shuan\\AppData\\Local\\Temp\\zh-real-herdr-Wjqc68\\herdr.sock\n",
+    "liveTransport": {
+        "code": 0,
+        "stdout": "bun test v1.4.4 (38afee6c8)\n",
+        "stderr": "\ntest\\herdr\\windows-transport.test.ts:\n(pass) resolveHerdRSocketPath keeps the Unix layout unchanged [0.46ms]\n(pass) resolveHerdRSocketPath uses the HerdR Windows config directory [0.30ms]\n(pass) resolveHerdRSocketPath prefers XDG_CONFIG_HOME and falls back to the profile [0.08ms]\n(pass) toHerdRNamedPipePath keeps the socket path verbatim after the pipe prefix [0.10ms]\n(pass) toHerdRNamedPipePath rejects empty and NUL-containing paths [1.52ms]\n(pass) connectHerdRChannel exchanges NDJSON over a named pipe [8.09ms]\n(pass) connectHerdRChannel names the derived pipe when no server is listening [1.26ms]\n(pass) reads a live read-only HerdR snapshot and subscription over the named pipe [174.45ms]\n(pass) reads a live HerdR snapshot reply through a single named-pipe request [1.40ms]\n\n 9 pass\n 0 fail\n 24 expect() calls\nRan 9 tests across 1 file. [628.00ms]\n"
+    },
+    "result": "PASS"
+}

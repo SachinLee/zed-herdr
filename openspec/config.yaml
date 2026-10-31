@@ -1,0 +1,12 @@
+schema: spec-driven
+
+# Project context (optional)
+# Add only constraints that should guide OpenSpec artifacts and workflows.
+# Include constraints an agent cannot infer by reading the code.
+# Keep general project documentation and discoverable codebase facts out.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+rules:
+  proposal:
+    - Write the proposal H1 as `# 提案：<中文短标题>` so `openspec change list` and routing prompts show a readable Chinese title; keep the section headings `## Why` and `## What Changes` in English because OpenSpec parses those names.

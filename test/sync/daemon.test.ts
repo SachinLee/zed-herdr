@@ -19,6 +19,7 @@ import type { EditorAdapterService } from "../../src/services/editor-adapter.ts"
 import type { WorkspaceHintSourceService } from "../../src/services/workspace-hint-source.ts";
 import type { WorkspaceSourceService } from "../../src/services/workspace-source.ts";
 import type {
+    ProjectMode,
     WorkspaceCwdHint,
     WorkspaceGeneration,
     WorkspaceId,
@@ -31,7 +32,7 @@ import { EditorAdapterError as EditorAdapterErrorValue } from "../../src/domain/
 import { EditorAdapter } from "../../src/services/editor-adapter.ts";
 import { WorkspaceHintSource } from "../../src/services/workspace-hint-source.ts";
 import { WorkspaceSource } from "../../src/services/workspace-source.ts";
-import { makeSyncDaemon } from "../../src/sync/daemon.ts";
+import { makeSyncDaemonWithProjectMode } from "../../src/sync/daemon.ts";
 
 interface CapturedLog {
     readonly message: string;
@@ -106,6 +107,7 @@ const advanceDebounce: Effect.Effect<void> = TestClock.adjust("50 millis").pipe(
 
 const makeHarness = (
     behavior: AdapterBehavior = {},
+    projectMode: ProjectMode = "git-root",
 ): Effect.Effect<DaemonHarness, never, Scope.Scope> =>
     Effect.gen(function* () {
         const events = yield* Queue.unbounded<{
@@ -170,7 +172,7 @@ const makeHarness = (
             BunContext.layer,
             Logger.replace(Logger.defaultLogger, logger),
         );
-        const daemon = yield* makeSyncDaemon.pipe(
+        const daemon = yield* makeSyncDaemonWithProjectMode(projectMode).pipe(
             Effect.provideService(WorkspaceSource, source),
             Effect.provideService(WorkspaceHintSource, hintSource),
             Effect.provideService(EditorAdapter, adapter),
@@ -194,11 +196,12 @@ const makeHarness = (
 const withDaemon = <A>(
     body: (harness: DaemonHarness) => Effect.Effect<A>,
     behavior: AdapterBehavior = {},
+    projectMode: ProjectMode = "git-root",
 ): Promise<A> =>
     Effect.runPromise(
         Effect.scoped(
             Effect.gen(function* () {
-                const harness = yield* makeHarness(behavior);
+                const harness = yield* makeHarness(behavior, projectMode);
                 return yield* body(harness);
             }),
         ).pipe(Effect.provide(TestContext.TestContext)),
@@ -530,7 +533,7 @@ test("deduplicates roots and retries a failed focus without caching the failure"
                             ).toHaveLength(2);
                             expect(cache.lastSuccessful).toEqual({
                                 workspaceId: workspaceId("a"),
-                                gitRoot: repo,
+                                projectPath: repo,
                             });
                             const failed = lastLog(harness, "workspace_sync_failed");
                             expect(failed?.annotations).toMatchObject({
@@ -604,7 +607,7 @@ test("retries a failed ensure and records its root only after it succeeds", asyn
                     Effect.zipRight(Ref.get(harness.daemon.cache)),
                     Effect.tap((cache) =>
                         Effect.sync(() => {
-                            expect(cache.ensuredGitRoots.has(repo)).toBeFalse();
+                            expect(cache.ensuredProjectPaths.has(repo)).toBeFalse();
                             expect(cache.lastSynchronizedAt).toBeNull();
                         }),
                     ),
@@ -616,7 +619,7 @@ test("retries a failed ensure and records its root only after it succeeds", asyn
                     Effect.tap((cache) =>
                         Effect.sync(() => {
                             expect(harness.calls).toEqual([`ensure:${repo}`, `ensure:${repo}`]);
-                            expect([...cache.ensuredGitRoots]).toEqual([repo]);
+                            expect([...cache.ensuredProjectPaths]).toEqual([repo]);
                             expect(cache.lastSynchronizedAt).not.toBeNull();
                         }),
                     ),
@@ -660,7 +663,7 @@ test("ensures a root introduced by a later snapshot without repeating prior root
                 Effect.tap((cache) =>
                     Effect.sync(() => {
                         expect(harness.calls).toEqual([`ensure:${repoA}`, `ensure:${repoB}`]);
-                        expect([...cache.ensuredGitRoots]).toEqual([repoA, repoB]);
+                        expect([...cache.ensuredProjectPaths]).toEqual([repoA, repoB]);
                     }),
                 ),
             );
@@ -691,7 +694,7 @@ test("stale ensure completion cannot record a root or synchronization time", asy
                     Effect.tap((cache) =>
                         Effect.sync(() => {
                             expect(cache.latestLiveGeneration).toBe(generation(2));
-                            expect(cache.ensuredGitRoots.has(oldRepo)).toBeFalse();
+                            expect(cache.ensuredProjectPaths.has(oldRepo)).toBeFalse();
                             expect(cache.lastSynchronizedAt).toBeNull();
                         }),
                     ),
@@ -722,7 +725,7 @@ test("stale ensure completion cannot record a root or synchronization time", asy
                     Effect.zipRight(Ref.get(harness.daemon.cache)),
                     Effect.tap((cache) =>
                         Effect.sync(() => {
-                            expect(cache.ensuredGitRoots.has(oldRepo)).toBeFalse();
+                            expect(cache.ensuredProjectPaths.has(oldRepo)).toBeFalse();
                             expect(cache.lastSynchronizedAt).toBeNull();
                         }),
                     ),
@@ -824,10 +827,10 @@ test("repeats ensure and focus for a reused root after a generation change", asy
                             `ensure:${repo}`,
                             `focus:${repo}`,
                         ]);
-                        expect([...cache.ensuredGitRoots]).toEqual([repo]);
+                        expect([...cache.ensuredProjectPaths]).toEqual([repo]);
                         expect(cache.lastSuccessful).toEqual({
                             workspaceId: workspaceId("workspace"),
-                            gitRoot: repo,
+                            projectPath: repo,
                         });
                     }),
                 ),
@@ -1123,5 +1126,39 @@ test("disabling interrupts live synchronization and re-enabling refreshes the cu
                 ),
             );
         });
+    });
+});
+
+test("directory mode forwards the non-Git parent to the adapter and dedupes by project path", async () => {
+    await withTemporaryDirectory(async (directory) => {
+        const parent = join(directory, "parent");
+        await mkdir(join(parent, "nested", ".git"), { recursive: true });
+        await withDaemon(
+            (harness) => {
+                queueSnapshot(
+                    harness,
+                    1,
+                    snapshot("a", [workspace("a", parent), workspace("duplicate", parent)]),
+                );
+                return emitInvalidated(harness, 1).pipe(
+                    Effect.zipRight(advanceDebounce),
+                    Effect.zipRight(awaitSnapshot(harness)),
+                    Effect.zipRight(awaitCalls(harness, 2)),
+                    Effect.zipRight(Ref.get(harness.daemon.cache)),
+                    Effect.tap((cache) =>
+                        Effect.sync(() => {
+                            expect(harness.calls).toEqual([`ensure:${parent}`, `focus:${parent}`]);
+                            expect([...cache.ensuredProjectPaths]).toEqual([parent]);
+                            expect(cache.lastSuccessful).toEqual({
+                                workspaceId: workspaceId("a"),
+                                projectPath: parent,
+                            });
+                        }),
+                    ),
+                );
+            },
+            {},
+            "directory",
+        );
     });
 });

@@ -11,24 +11,45 @@ import {
     rmdir,
     unlink,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import * as Schema from "effect/Schema";
 
 import {
     AlreadyRunning,
+    CONTROL_DAEMON_IDENTITY,
     ControlUnavailable,
+    controlLockPath,
     controlSocketPath,
+    healthControl,
     notifyControl,
     prepareControlSocket,
     prepareControlSocketDirectory,
 } from "./control.ts";
-import { HookNotification, type HookNotification as HookNotificationValue } from "./protocol.ts";
+import { spawnBackgroundDaemon, type DaemonSpawner } from "./daemon-process.ts";
+import { defaultDaemonLog, type DaemonLogCommands } from "./daemon-log.ts";
+import {
+    HookNotification,
+    type DaemonHealth,
+    type HookNotification as HookNotificationValue,
+} from "./protocol.ts";
+import {
+    createWindowsLockCandidate,
+    discardWindowsLockCandidate,
+    publishWindowsLockFile,
+    readWindowsLockFile,
+    takeWindowsLockFile,
+    UnsafeWindowsLockFile,
+    WindowsLockContended,
+    type WindowsFileIdentity,
+    type WindowsLockSnapshot,
+    type WindowsLockTake,
+} from "./windows-lock.ts";
+import { ensureWindowsStateDirectory, isWindowsControlPlatform } from "./windows-pipe.ts";
 
 const CONTROL_READINESS_MS = 1_500;
 const LOCK_STALE_MS = 5_000;
 const LOCK_POLL_MS = 25;
-const PLUGIN_ID = "artisann.zed-herdr";
 
 const NonEmptyText = Schema.String.pipe(Schema.nonEmptyString(), Schema.maxLength(4_096));
 const HookEvent = Schema.Struct({
@@ -53,6 +74,7 @@ interface LockIdentity {
 
 export interface HookControlApi {
     readonly controlSocketPath: (environment: NodeJS.ProcessEnv) => string;
+    readonly healthControl: (path: string, timeoutMs?: number) => Promise<DaemonHealth>;
     readonly prepareControlSocket: (path: string) => Promise<void>;
     readonly prepareControlSocketDirectory: (path: string) => Promise<void>;
     readonly notifyControl: (
@@ -62,27 +84,31 @@ export interface HookControlApi {
     ) => Promise<void>;
 }
 
-export type PaneOpenCommand = (argv: ReadonlyArray<string>) => Promise<void>;
-
 export interface HookStartupOptions {
     readonly control?: HookControlApi;
     readonly environment?: NodeJS.ProcessEnv;
+    readonly log?: DaemonLogCommands;
     readonly now?: () => number;
-    readonly openPane?: PaneOpenCommand;
     readonly pid?: number;
     readonly sleep?: (milliseconds: number) => Promise<void>;
+    readonly spawnDaemon?: DaemonSpawner;
     readonly token?: () => string;
 }
 
 export type HookStartupResult =
     | { readonly _tag: "Skipped"; readonly reason: "missing_workspace_or_cwd" }
-    | { readonly _tag: "Notified"; readonly openedPane: boolean };
+    | { readonly _tag: "Notified"; readonly startedDaemon: boolean };
+
+export type EnsureDaemonResult = {
+    readonly status: "started" | "already_running";
+    readonly daemon: DaemonHealth;
+};
 
 export class HookStartupError extends Error {
     readonly _tag = "HookStartupError";
 
     constructor(
-        readonly operation: "open_pane" | "readiness" | "lock",
+        readonly operation: "lock" | "log" | "readiness" | "spawn",
         message: string,
     ) {
         super(message);
@@ -92,6 +118,7 @@ export class HookStartupError extends Error {
 
 const defaultControl: HookControlApi = {
     controlSocketPath,
+    healthControl,
     prepareControlSocket,
     prepareControlSocketDirectory,
     notifyControl,
@@ -110,6 +137,7 @@ const awaitWithinDeadline = async <Value>(
 ): Promise<Value> => {
     const remaining = deadline - now();
     if (remaining <= 0) {
+        void operation.catch(() => undefined);
         throw new HookStartupError("readiness", "Timed out waiting for control socket readiness");
     }
 
@@ -357,6 +385,169 @@ const writeLockOwner = async (path: string, contents: LockContents): Promise<voi
     await chmod(ownerPath, 0o600);
 };
 
+interface WindowsLockInspection {
+    readonly contents: LockContents;
+    readonly identity: WindowsFileIdentity;
+}
+
+/**
+ * Read a Windows lock file together with its stable NTFS identity. Unlike the
+ * POSIX layout there is no lock directory: NTFS reports a synthetic mode and
+ * uid 0, so ownership comes from the inherited user-only state-directory ACL
+ * and durability from an atomic exclusive create.
+ */
+const inspectWindowsLock = async (path: string): Promise<WindowsLockInspection | null> => {
+    let snapshot: WindowsLockSnapshot | null;
+    try {
+        snapshot = await readWindowsLockFile(path);
+    } catch (error) {
+        // A live or foreign handle denies access with EBUSY/EACCES/EPERM. That
+        // is contention, not a verdict: report "no lock visible right now" so
+        // callers poll again instead of failing the hook or taking over a live
+        // lock.
+        if (error instanceof WindowsLockContended) {
+            return null;
+        }
+        if (error instanceof UnsafeWindowsLockFile) {
+            throw new HookStartupError(
+                "lock",
+                `Refusing unsafe hook lock at ${path}: ${error.reason}`,
+            );
+        }
+        throw new HookStartupError(
+            "lock",
+            `Unable to inspect hook lock at ${path}: ${String(error)}`,
+        );
+    }
+    if (snapshot === null) {
+        return null;
+    }
+
+    const contents = parseLock(snapshot.contents);
+    if (contents === undefined) {
+        throw new HookStartupError("lock", `Refusing malformed hook lock at ${path}`);
+    }
+    return { contents, identity: snapshot.identity };
+};
+
+const removeStaleWindowsLock = async (path: string, now: number): Promise<boolean> => {
+    const initial = await inspectWindowsLock(path);
+    if (initial === null || now - initial.contents.createdAt < LOCK_STALE_MS) {
+        return false;
+    }
+
+    const current = await inspectWindowsLock(path);
+    if (current === null) {
+        return false;
+    }
+    if (current.contents.token !== initial.contents.token) {
+        return false;
+    }
+    if (!sameIdentity(initial.identity, current.identity)) {
+        return false;
+    }
+    if (now - current.contents.createdAt < LOCK_STALE_MS) {
+        return false;
+    }
+
+    let taken: WindowsLockTake;
+    try {
+        taken = await takeWindowsLockFile(path, current.identity);
+    } catch (error) {
+        // Rename/unlink failures after both inspections are not a hook verdict;
+        // surface them as this module's lock error instead of a raw fs error.
+        throw new HookStartupError(
+            "lock",
+            `Unable to remove stale hook lock at ${path}: ${String(error)}`,
+        );
+    }
+    return taken === "taken";
+};
+
+const acquireWindowsLock = async (
+    path: string,
+    contents: LockContents,
+    deadline: number,
+    now: () => number,
+    sleep: (milliseconds: number) => Promise<void>,
+): Promise<void> => {
+    try {
+        await ensureWindowsStateDirectory(dirname(path));
+    } catch (error) {
+        throw new HookStartupError(
+            "lock",
+            `Unable to prepare hook lock directory for ${path}: ${String(error)}`,
+        );
+    }
+
+    // The candidate name carries this process's random token, so any leftover is
+    // this invocation's own abandoned artifact rather than a contended lock.
+    const candidate = `${path}.${contents.token}.tmp`;
+    await discardWindowsLockCandidate(candidate).catch(() => undefined);
+
+    for (;;) {
+        try {
+            await createWindowsLockCandidate(candidate, JSON.stringify(contents));
+        } catch (error) {
+            // Only this invocation's token can collide with its candidate name,
+            // so a collision means an abandoned artifact or a dying handle, not
+            // a contended lock. Discard and keep polling.
+            if (isNodeError(error, "EEXIST") || isNodeError(error, "EBUSY")) {
+                await discardWindowsLockCandidate(candidate).catch(() => undefined);
+                if (now() >= deadline) {
+                    throw new HookStartupError(
+                        "readiness",
+                        "Timed out waiting for control socket readiness",
+                    );
+                }
+                await sleep(LOCK_POLL_MS);
+                continue;
+            }
+            throw new HookStartupError(
+                "lock",
+                `Unable to write hook lock owner at ${path}: ${String(error)}`,
+            );
+        }
+
+        let acquired = false;
+        try {
+            await publishWindowsLockFile(candidate, path);
+            acquired = true;
+        } catch (error) {
+            await discardWindowsLockCandidate(candidate).catch(() => undefined);
+            if (!isNodeError(error, "EEXIST")) {
+                throw new HookStartupError(
+                    "lock",
+                    `Unable to acquire hook lock at ${path}: ${String(error)}`,
+                );
+            }
+        }
+        if (acquired) {
+            return;
+        }
+
+        await removeStaleWindowsLock(path, now());
+        if (now() >= deadline) {
+            throw new HookStartupError(
+                "readiness",
+                "Timed out waiting for control socket readiness",
+            );
+        }
+        await sleep(LOCK_POLL_MS);
+    }
+};
+
+const releaseWindowsLock = async (path: string, token: string): Promise<void> => {
+    const current = await inspectWindowsLock(path);
+    if (current !== null && current.contents.token === token) {
+        // A denied capture must not turn a successful hook into a failure; the
+        // stale takeover path will collect an abandoned lock later.
+        await takeWindowsLockFile(path, current.identity).catch(() => undefined);
+    }
+    // Collect this invocation's candidate if publish could not unlink it.
+    await discardWindowsLockCandidate(`${path}.${token}.tmp`).catch(() => undefined);
+};
+
 const acquireLock = async (
     path: string,
     contents: LockContents,
@@ -364,6 +555,10 @@ const acquireLock = async (
     now: () => number,
     sleep: (milliseconds: number) => Promise<void>,
 ): Promise<void> => {
+    if (isWindowsControlPlatform()) {
+        await acquireWindowsLock(path, contents, deadline, now, sleep);
+        return;
+    }
     const candidate = `${path}.${contents.token}.tmp`;
     for (;;) {
         try {
@@ -429,6 +624,10 @@ const acquireLock = async (
 };
 
 const releaseLock = async (path: string, token: string): Promise<void> => {
+    if (isWindowsControlPlatform()) {
+        await releaseWindowsLock(path, token);
+        return;
+    }
     let current: LockInspection;
     try {
         current = await inspectLock(path);
@@ -467,137 +666,52 @@ const releaseLock = async (path: string, token: string): Promise<void> => {
     await removeCapturedLock(path, final);
 };
 
-const defaultOpenPane = async (
-    argv: ReadonlyArray<string>,
-    deadline: number,
-    now: () => number,
-): Promise<void> => {
-    if (deadline - now() <= 0) {
-        throw new HookStartupError("readiness", "Timed out waiting for control socket readiness");
-    }
-
-    let child: Bun.Subprocess;
-    try {
-        child = Bun.spawn({ cmd: [...argv], stdout: "ignore", stderr: "ignore" });
-    } catch (error) {
-        throw new HookStartupError("open_pane", `Unable to start HerdR: ${String(error)}`);
-    }
-
-    let exitCode: number;
-    try {
-        exitCode = await awaitWithinDeadline(child.exited, deadline, now);
-    } catch (error) {
-        try {
-            child.kill("SIGKILL");
-        } catch {
-            // The child may have already exited between the timeout and kill.
-        }
-        void child.exited.catch(() => undefined);
-        throw error;
-    }
-    if (exitCode !== 0) {
-        throw new HookStartupError("open_pane", `HerdR pane open exited with code ${exitCode}`);
-    }
-};
-
-const paneOpenArgv = (
-    workspaceId: string,
-    environment: NodeJS.ProcessEnv,
-): ReadonlyArray<string> => [
-    decodeNonEmptyText(environment.HERDR_BIN_PATH) ?? "herdr",
-    "plugin",
-    "pane",
-    "open",
-    "--plugin",
-    PLUGIN_ID,
-    "--entrypoint",
-    "daemon",
-    "--placement",
-    "tab",
-    "--workspace",
-    workspaceId,
-    "--no-focus",
-];
-
-const notifyUntilReady = async (
+const checkedHealth = async (
     control: HookControlApi,
     path: string,
-    notification: HookNotification,
     deadline: number,
     now: () => number,
-    sleep: (milliseconds: number) => Promise<void>,
-): Promise<void> => {
-    for (;;) {
-        const remaining = deadline - now();
-        if (remaining <= 0) {
-            throw new HookStartupError(
-                "readiness",
-                "Timed out waiting for control socket readiness",
-            );
-        }
-        try {
-            await control.notifyControl(path, notification, remaining);
-            return;
-        } catch (error) {
-            if (!(error instanceof ControlUnavailable)) {
-                throw error;
-            }
-            if (now() >= deadline) {
-                throw new HookStartupError(
-                    "readiness",
-                    "Timed out waiting for control socket readiness",
-                );
-            }
-            await sleep(LOCK_POLL_MS);
-        }
+): Promise<DaemonHealth> => {
+    const daemon = await invokeWithinDeadline(
+        () => control.healthControl(path, Math.max(1, deadline - now())),
+        deadline,
+        now,
+    );
+    if (daemon.identity !== CONTROL_DAEMON_IDENTITY) {
+        throw new HookStartupError(
+            "readiness",
+            "Control socket returned the wrong daemon identity",
+        );
     }
+    return daemon;
 };
 
-/**
- * Start this plugin's daemon only when needed, then publish the hook's cwd hint.
- * The lock spans pane creation and control readiness so concurrent HerdR hooks open
- * at most one unfocused daemon pane.
- */
-export const runHook = async (options: HookStartupOptions = {}): Promise<HookStartupResult> => {
+export const ensureDaemon = async (
+    options: HookStartupOptions = {},
+    deadline = (options.now ?? Date.now)() + CONTROL_READINESS_MS,
+): Promise<EnsureDaemonResult> => {
     const environment = options.environment ?? process.env;
-    const notification = decodeHookNotification(environment);
-    if (notification === undefined) {
-        return { _tag: "Skipped", reason: "missing_workspace_or_cwd" };
-    }
-
     const control = options.control ?? defaultControl;
     const now = options.now ?? Date.now;
     const sleep = options.sleep ?? delay;
-    const token = options.token ?? randomUUID;
     const path = control.controlSocketPath(environment);
-    const deadline = now() + CONTROL_READINESS_MS;
     await invokeWithinDeadline(() => control.prepareControlSocketDirectory(path), deadline, now);
-
     try {
-        const remaining = deadline - now();
-        if (remaining <= 0) {
-            throw new HookStartupError(
-                "readiness",
-                "Timed out waiting for control socket readiness",
-            );
-        }
-        await control.notifyControl(path, notification, remaining);
-        return { _tag: "Notified", openedPane: false };
+        return {
+            status: "already_running",
+            daemon: await checkedHealth(control, path, deadline, now),
+        };
     } catch (error) {
-        if (!(error instanceof ControlUnavailable)) {
-            throw error;
-        }
-        if (now() >= deadline) {
+        if (!(error instanceof ControlUnavailable)) throw error;
+        if (now() >= deadline)
             throw new HookStartupError(
                 "readiness",
                 "Timed out waiting for control socket readiness",
             );
-        }
-        // An absent or not-yet-ready daemon is resolved under the per-session lock.
     }
 
-    const lockPath = `${path}.lock`;
-    const lockToken = token();
+    const lockPath = controlLockPath(path, environment);
+    const lockToken = (options.token ?? randomUUID)();
     await acquireLock(
         lockPath,
         { pid: options.pid ?? process.pid, token: lockToken, createdAt: now() },
@@ -605,45 +719,112 @@ export const runHook = async (options: HookStartupOptions = {}): Promise<HookSta
         now,
         sleep,
     );
-
     try {
-        const remaining = deadline - now();
-        if (remaining <= 0) {
-            throw new HookStartupError(
-                "readiness",
-                "Timed out waiting for control socket readiness",
-            );
-        }
         try {
-            await control.notifyControl(path, notification, remaining);
-            return { _tag: "Notified", openedPane: false };
+            return {
+                status: "already_running",
+                daemon: await checkedHealth(control, path, deadline, now),
+            };
         } catch (error) {
-            if (!(error instanceof ControlUnavailable)) {
-                throw error;
-            }
-            // Recheck under the lock before altering an orphaned socket or opening a pane.
+            if (!(error instanceof ControlUnavailable)) throw error;
+            if (now() >= deadline)
+                throw new HookStartupError(
+                    "readiness",
+                    "Timed out waiting for control socket readiness",
+                );
         }
-
-        let openedPane = false;
         try {
             await invokeWithinDeadline(() => control.prepareControlSocket(path), deadline, now);
-            const argv = paneOpenArgv(notification.workspaceId, environment);
-            const openPane = options.openPane;
-            if (openPane === undefined) {
-                await defaultOpenPane(argv, deadline, now);
-            } else {
-                await invokeWithinDeadline(() => openPane(argv), deadline, now);
-            }
-            openedPane = true;
         } catch (error) {
-            if (!(error instanceof AlreadyRunning)) {
-                throw error;
-            }
+            if (!(error instanceof AlreadyRunning)) throw error;
+            return {
+                status: "already_running",
+                daemon: await checkedHealth(control, path, deadline, now),
+            };
         }
-
-        await notifyUntilReady(control, path, notification, deadline, now, sleep);
-        return { _tag: "Notified", openedPane };
+        const log = options.log ?? defaultDaemonLog;
+        try {
+            await invokeWithinDeadline(
+                () => log.preflight(log.path(path, environment)),
+                deadline,
+                now,
+            );
+        } catch (error) {
+            if (error instanceof HookStartupError) throw error;
+            throw new HookStartupError(
+                "log",
+                `Unable to prepare daemon log: ${String(error).slice(-4096)}`,
+            );
+        }
+        let child: ReturnType<DaemonSpawner>;
+        try {
+            if (now() >= deadline)
+                throw new HookStartupError(
+                    "readiness",
+                    "Timed out waiting for control socket readiness",
+                );
+            child = (options.spawnDaemon ?? spawnBackgroundDaemon)(environment);
+        } catch (error) {
+            if (error instanceof HookStartupError) throw error;
+            throw new HookStartupError(
+                "spawn",
+                `Unable to start daemon: ${String(error).slice(-4096)}`,
+            );
+        }
+        let exitCode: number | undefined;
+        void child.exited.then(
+            (code) => {
+                exitCode = code;
+            },
+            () => {
+                exitCode = -1;
+            },
+        );
+        try {
+            for (;;) {
+                if (exitCode !== undefined)
+                    throw new HookStartupError("readiness", `Daemon exited with code ${exitCode}`);
+                if (now() >= deadline)
+                    throw new HookStartupError(
+                        "readiness",
+                        "Timed out waiting for control socket readiness",
+                    );
+                try {
+                    return {
+                        status: "started",
+                        daemon: await checkedHealth(control, path, deadline, now),
+                    };
+                } catch (error) {
+                    if (!(error instanceof ControlUnavailable)) throw error;
+                    await invokeWithinDeadline(
+                        () => sleep(Math.min(LOCK_POLL_MS, Math.max(0, deadline - now()))),
+                        deadline,
+                        now,
+                    );
+                }
+            }
+        } catch (error) {
+            child.kill();
+            throw error;
+        }
     } finally {
         await releaseLock(lockPath, lockToken);
     }
+};
+
+export const runHook = async (options: HookStartupOptions = {}): Promise<HookStartupResult> => {
+    const environment = options.environment ?? process.env;
+    const notification = decodeHookNotification(environment);
+    if (notification === undefined) return { _tag: "Skipped", reason: "missing_workspace_or_cwd" };
+    const now = options.now ?? Date.now;
+    const deadline = now() + CONTROL_READINESS_MS;
+    const result = await ensureDaemon(options, deadline);
+    const control = options.control ?? defaultControl;
+    const path = control.controlSocketPath(environment);
+    await invokeWithinDeadline(
+        () => control.notifyControl(path, notification, Math.max(1, deadline - now())),
+        deadline,
+        now,
+    );
+    return { _tag: "Notified", startedDaemon: result.status === "started" };
 };

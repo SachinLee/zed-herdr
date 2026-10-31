@@ -10,6 +10,7 @@ import * as Stream from "effect/Stream";
 import { runCli } from "../../src/cli.ts";
 import {
     CONTROL_DAEMON_IDENTITY,
+    controlLockPath,
     controlSocketPath,
     notifyControl,
     prepareControlSocketDirectory,
@@ -18,6 +19,7 @@ import {
 import type { ControlServer } from "../../src/plugin/control.ts";
 import { runHook } from "../../src/plugin/hook.ts";
 import { HealthControlResponse, HookNotification } from "../../src/plugin/protocol.ts";
+import { isWindowsControlPlatform, windowsPipePresence } from "../../src/plugin/windows-pipe.ts";
 
 interface CliObservation {
     readonly exitCode: typeof process.exitCode;
@@ -39,6 +41,10 @@ const controlEnvironment = (
     overrides: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv => ({
     HERDR_SOCKET_PATH: herdrSocket,
+    // Windows derives both the pipe name and the hook lock path from the
+    // per-account state root, exactly as a real daemon invocation would.
+    LOCALAPPDATA: process.env.LOCALAPPDATA,
+    USERPROFILE: process.env.USERPROFILE,
     ...overrides,
 });
 
@@ -79,6 +85,13 @@ const createOrphanedSocket = async (path: string): Promise<void> => {
         await child.exited;
     }
 
+    if (isWindowsControlPlatform()) {
+        // A named pipe belongs to the kernel: terminating the owner removes the
+        // name, so a Windows "orphan" is simply an absent endpoint.
+        expect(await windowsPipePresence(path)).toBe("absent");
+        return;
+    }
+
     const uid = process.getuid?.();
     if (uid === undefined) {
         throw new Error("control sockets require a POSIX uid");
@@ -89,7 +102,7 @@ const createOrphanedSocket = async (path: string): Promise<void> => {
 };
 
 const runControlCli = async (
-    command: "health" | "toggle",
+    command: "health" | "stop" | "toggle",
     environment: NodeJS.ProcessEnv,
 ): Promise<CliObservation> => {
     const originalLog = console.log;
@@ -116,9 +129,12 @@ const runControlCli = async (
     }
 };
 
-const runIsolatedHealthCli = async (herdrSocket: string): Promise<IsolatedCliObservation> => {
+const runIsolatedControlCli = async (
+    command: "health" | "stop" | "toggle",
+    herdrSocket: string,
+): Promise<IsolatedCliObservation> => {
     const child = Bun.spawn({
-        cmd: [process.execPath, "index.ts", "health"],
+        cmd: [process.execPath, "index.ts", command],
         env: { ...process.env, HERDR_SOCKET_PATH: herdrSocket },
         stderr: "pipe",
         stdout: "pipe",
@@ -130,6 +146,9 @@ const runIsolatedHealthCli = async (herdrSocket: string): Promise<IsolatedCliObs
     ]);
     return { exitCode, stderr, stdout };
 };
+
+const runIsolatedHealthCli = async (herdrSocket: string): Promise<IsolatedCliObservation> =>
+    runIsolatedControlCli("health", herdrSocket);
 
 test("health and toggle CLIs control the real daemon and reject absent health sockets", async () => {
     const directory = await makeTemporaryDirectory();
@@ -174,10 +193,30 @@ test("health and toggle CLIs control the real daemon and reject absent health so
         expect(absent.exitCode).toBe(1);
         expect(absent.stdout).toBe("");
 
-        await writeFile(path, "not a socket", { mode: 0o600 });
-        const invalid = await runIsolatedHealthCli(herdrSocket);
-        expect(invalid.exitCode).toBe(1);
-        expect(invalid.stdout).toBe("");
+        if (isWindowsControlPlatform()) {
+            // A filesystem write cannot occupy a pipe name; the Windows analogue
+            // of a foreign endpoint is a listener that answers with garbage.
+            const squatter = Bun.listen({
+                unix: path,
+                socket: {
+                    data(socket) {
+                        socket.end("{}\n");
+                    },
+                },
+            });
+            try {
+                const invalid = await runIsolatedHealthCli(herdrSocket);
+                expect(invalid.exitCode).toBe(1);
+                expect(invalid.stdout).toBe("");
+            } finally {
+                squatter.stop(true);
+            }
+        } else {
+            await writeFile(path, "not a socket", { mode: 0o600 });
+            const invalid = await runIsolatedHealthCli(herdrSocket);
+            expect(invalid.exitCode).toBe(1);
+            expect(invalid.stdout).toBe("");
+        }
     } finally {
         await server?.close();
         await rm(path, { force: true });
@@ -199,13 +238,25 @@ test("direct daemon startup replaces an orphaned socket and cleans its bound ino
             notifications: { async publish() {} },
         });
 
-        const bound = await lstat(path);
-        expect(bound.isSocket()).toBe(true);
-        expect(await readFile(`${path}.lock`, "utf8").catch(() => undefined)).toBeUndefined();
+        if (isWindowsControlPlatform()) {
+            expect(await windowsPipePresence(path)).toBe("present");
+        } else {
+            const bound = await lstat(path);
+            expect(bound.isSocket()).toBe(true);
+        }
+        expect(
+            await readFile(controlLockPath(path, controlEnvironment(herdrSocket)), "utf8").catch(
+                () => undefined,
+            ),
+        ).toBeUndefined();
 
         await server.close();
         server = undefined;
-        await expect(lstat(path)).rejects.toMatchObject({ code: "ENOENT" });
+        if (isWindowsControlPlatform()) {
+            expect(await windowsPipePresence(path)).toBe("absent");
+        } else {
+            await expect(lstat(path)).rejects.toMatchObject({ code: "ENOENT" });
+        }
     } finally {
         await server?.close();
         await rm(path, { force: true });
@@ -219,7 +270,7 @@ test("hook recovers an orphan, opens one daemon, waits for readiness, and publis
     const environment = hookEnvironment(herdrSocket);
     const path = controlSocketPath(environment);
     const notifications: Array<HookNotification> = [];
-    const paneCommands: Array<ReadonlyArray<string>> = [];
+    let starts = 0;
     let server: ControlServer | undefined;
 
     try {
@@ -227,48 +278,41 @@ test("hook recovers an orphan, opens one daemon, waits for readiness, and publis
 
         const result = await runHook({
             environment,
-            openPane: async (command) => {
-                paneCommands.push(command);
-                server = await startControlServer({
+            spawnDaemon: () => {
+                starts += 1;
+                void startControlServer({
                     path,
-                    paneId: "hook-created-pane",
+                    paneId: null,
                     notifications: {
                         async publish(notification) {
                             notifications.push(notification);
                         },
                     },
+                }).then((created) => {
+                    server = created;
                 });
+                return {
+                    pid: 42,
+                    exited: new Promise<number>(() => undefined),
+                    kill: () => undefined,
+                };
             },
         });
 
-        expect(result).toEqual({ _tag: "Notified", openedPane: true });
-        expect(paneCommands).toEqual([
-            [
-                "herdr",
-                "plugin",
-                "pane",
-                "open",
-                "--plugin",
-                "artisann.zed-herdr",
-                "--entrypoint",
-                "daemon",
-                "--placement",
-                "tab",
-                "--workspace",
-                "integration-workspace",
-                "--no-focus",
-            ],
-        ]);
+        expect(result).toEqual({ _tag: "Notified", startedDaemon: true });
+        expect(starts).toBe(1);
         expect(notifications).toEqual([
             Schema.decodeUnknownSync(HookNotification)({
                 workspaceId: "integration-workspace",
                 cwd: "/repo/integration",
             }),
         ]);
-        await expect(readFile(`${path}.lock`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(readFile(controlLockPath(path, environment), "utf8")).rejects.toMatchObject({
+            code: "ENOENT",
+        });
     } finally {
         await server?.close();
-        await unlink(`${path}.lock`).catch(() => undefined);
+        await unlink(controlLockPath(path, environment)).catch(() => undefined);
         await rm(path, { force: true });
         await rm(directory, { force: true, recursive: true });
     }
@@ -314,3 +358,48 @@ test("buffers a control notification received before hint stream consumption", a
         await rm(directory, { force: true, recursive: true });
     }
 });
+
+test("stop CLI shuts down the matching daemon and reports an absent endpoint", async () => {
+    const directory = await makeTemporaryDirectory();
+    const herdrSocket = join(directory, "herdr.sock");
+    const path = controlSocketPath(controlEnvironment(herdrSocket));
+    let server: ControlServer | undefined;
+    let stops = 0;
+
+    try {
+        server = await startControlServer({
+            path,
+            paneId: "injected-daemon-pane",
+            notifications: { async publish() {} },
+            stopRequested() {
+                stops += 1;
+                void server?.close();
+            },
+        });
+        const expected = server.daemon;
+
+        const stopped = await runControlCli("stop", controlEnvironment(herdrSocket));
+        expect(stopped.exitCode).toBeUndefined();
+        expect(stopped.stderr).toEqual([]);
+        expect(stopped.stdout).toEqual([JSON.stringify({ ok: true, daemon: expected })]);
+        expect(stops).toBe(1);
+        if (isWindowsControlPlatform()) {
+            expect(await windowsPipePresence(path)).toBe("absent");
+        } else {
+            await expect(lstat(path)).rejects.toMatchObject({ code: "ENOENT" });
+        }
+
+        // A second stop finds nothing to stop and never starts a daemon. The
+        // non-zero exit is observed in a child process so the suite's own
+        // `process.exitCode` is never pinned by a failed command.
+        const absent = await runIsolatedControlCli("stop", herdrSocket);
+        expect(absent.exitCode).toBe(1);
+        expect(absent.stdout).toBe("");
+        expect(absent.stderr.trim().length).toBeGreaterThan(0);
+        expect(stops).toBe(1);
+    } finally {
+        await server?.close();
+        await rm(path, { force: true });
+        await rm(directory, { force: true, recursive: true });
+    }
+}, 3_000);

@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-10-30
+goal: "Remove the mandatory HerdR daemon pane so the plugin works headless:
+  hooks, start, stop, health, and plugin update all manage one detached daemon
+  whose lifecycle is owned by the plugin instead of a terminal pane."

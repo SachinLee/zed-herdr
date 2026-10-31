@@ -6,11 +6,11 @@ import * as Effect from "effect/Effect";
 import * as Inspectable from "effect/Inspectable";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { WorkspaceId, WorkspaceRecord } from "../../src/domain/workspace.ts";
+import type { ProjectMode, WorkspaceId, WorkspaceRecord } from "../../src/domain/workspace.ts";
 import { resolveProject } from "../../src/sync/resolve-project.ts";
 
 interface ProcessPlan {
@@ -50,8 +50,8 @@ const makeExecutor = (plan: ProcessPlan): CommandExecutor.CommandExecutor =>
         return Effect.succeed(process);
     });
 
-const resolveWith = (candidate: string, plan: ProcessPlan) =>
-    resolveProject(workspace(candidate), new Map()).pipe(
+const resolveWith = (candidate: string, plan: ProcessPlan, projectMode: ProjectMode = "git-root") =>
+    resolveProject(workspace(candidate), new Map(), projectMode).pipe(
         Effect.provideService(CommandExecutor.CommandExecutor, makeExecutor(plan)),
         Effect.provide(BunContext.layer),
     );
@@ -74,7 +74,7 @@ test("preserves whitespace and embedded newlines in the Git-emitted root", async
             }),
         );
 
-        expect(project.gitRoot).toBe(emittedRoot);
+        expect(project.projectPath).toBe(emittedRoot);
     });
 });
 
@@ -109,5 +109,38 @@ test("keeps non-zero and empty successful Git results as not_git_repository", as
 
         expect(nonZero.reason).toBe("not_git_repository");
         expect(empty.reason).toBe("not_git_repository");
+    });
+});
+
+test("directory mode opens a non-Git candidate without invoking Git", async () => {
+    await withTemporaryDirectory(async (directory) => {
+        const project = await Effect.runPromise(
+            resolveWith(
+                directory,
+                {
+                    spawnFailure: new PlatformError.BadArgument({
+                        module: "Command",
+                        method: "start",
+                        description: "directory mode must not invoke Git",
+                    }),
+                },
+                "directory",
+            ),
+        );
+
+        expect(project.projectPath).toBe(directory);
+        expect(project.cwd).toBe(directory);
+    });
+});
+
+test("directory mode does not promote a nested Git repository", async () => {
+    await withTemporaryDirectory(async (directory) => {
+        const nested = join(directory, "nested");
+        await mkdir(join(nested, ".git"), { recursive: true });
+
+        const project = await Effect.runPromise(resolveWith(directory, {}, "directory"));
+
+        expect(project.projectPath).toBe(directory);
+        expect(project.projectPath).not.toBe(nested);
     });
 });

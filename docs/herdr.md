@@ -42,10 +42,16 @@ names are ignored.
 
 ## Contracts and state
 
-`LiveHerdRClient` owns the Unix sockets, monotonically increasing connection generations,
+`LiveHerdRClient` owns the local transport channels, monotonically increasing connection generations,
 generation-local snapshot requests, the current live subscription, reconnect state, and a
 replay-one `PubSub`. Replay one lets a consumer that subscribes after acknowledgement still receive
 the most recent source event.
+
+`src/herdr/windows-transport.ts` preserves Unix socket connections on macOS/Linux and uses native
+Bun named-pipe connections on Windows. The Windows pipe name is the literal `\\.\pipe\` prefix
+followed by the HerdR marker path verbatim. The marker file is never read for connection data or
+treated as proof of liveness. Transport framing and generation cancellation are shared across hosts.
+Live read-only Windows tests require `ZED_HERDR_TEST_LIVE=1`; normal tests use isolated fake peers.
 
 `makeHerdRWorkspaceSource` exposes only `snapshot` and `events`.
 `HerdRWorkspaceSourceLive` projects the scoped `HerdRClient` onto the core `WorkspaceSource` tag.

@@ -23,8 +23,9 @@ failures; it does not expose HerdR wire objects or Zed process details.
 - `WorkspaceRecord`: `{ workspaceId, name, checkoutPath: string | null, isLinkedWorktree }`, the
   editor-independent workspace projection from a HerdR snapshot.
 - `WorkspaceSnapshot`: `{ focusedWorkspaceId: WorkspaceId | null, workspaces }`.
-- `WorkspaceProject`: `{ workspaceId, name, cwd, gitRoot, source: "worktree" | "plugin",
-isLinkedWorktree }`, a record after path and Git-root resolution.
+- `ProjectMode`: `"git-root" | "directory"`, selecting Git-root or direct-directory resolution.
+- `WorkspaceProject`: `{ workspaceId, name, cwd, projectPath, source: "worktree" | "plugin",
+isLinkedWorktree }`, a record after project-path resolution.
 - `WorkspaceCwdHint`: `{ workspaceId, cwd }`, the plugin hook's fallback path signal.
 
 The shared text fields are nonempty and bounded to 4,096 characters. `WorkspaceSourceEvent` is the
@@ -34,7 +35,7 @@ union of `WorkspaceInvalidated` and `WorkspaceDisconnected`.
 
 Domain values describe observations and resolved state, not mutable services. A source event names
 the generation to which it belongs. A snapshot contains all authoritative workspace records for
-one synchronization pass. A resolved project carries both the selected cwd and canonical Git root,
+one synchronization pass. A resolved project carries both the selected cwd and resolved project path,
 plus whether its path came from a HerdR worktree or a plugin hint.
 
 The generation number alone is not permission to mutate state. The

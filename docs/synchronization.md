@@ -17,7 +17,7 @@ The daemon owns:
 - runtime enable/disable state and interruption;
 - a 50 ms burst collapse;
 - authoritative S2 snapshot retrieval;
-- resolution of every workspace to a canonical Git root;
+- resolution of every workspace to a canonical Git root or the selected directory;
 - atomic cache replacement and stale-hint pruning;
 - ordered, unique ensure calls and focused-project selection;
 - stable structured synchronization logs.
@@ -35,8 +35,8 @@ process policy remains in the [Zed adapter](editor.md).
 | `snapshot`             | The most recently installed authoritative snapshot                    |
 | `cwdHints`             | Latest plugin cwd by workspace id                                     |
 | `projects`             | Successfully resolved project by workspace id                         |
-| `ensuredGitRoots`      | Roots successfully ensured during the current source generation       |
-| `lastSuccessful`       | Last successfully focused `{ workspaceId, gitRoot }`                  |
+| `ensuredProjectPaths`  | Paths successfully ensured during the current source generation       |
+| `lastSuccessful`       | Last successfully focused `{ workspaceId, projectPath }`              |
 | `lastSynchronizedAt`   | Millisecond timestamp of the last recorded ensure or focus success    |
 
 `Invalidated` and `Disconnected` events form one ingress path. `WorkspaceCwdHint` values form the
@@ -45,7 +45,7 @@ an active cancellation token. This allows a hint received before the first live 
 used by a later snapshot without starting work prematurely.
 
 An `Invalidated` event older than the live generation is ignored. A newer generation cancels all
-older generation work. Changing generations resets the daemon's `ensuredGitRoots` and
+older generation work. Changing generations resets the daemon's `ensuredProjectPaths` and
 `lastSuccessful`; these fields are generation-local.
 
 Disabling resolves the current control-cycle signal, drains queued refreshes, and prevents source
@@ -64,10 +64,10 @@ fresh refresh for the current live generation.
 4. It gates again, reads the current cwd hints, and resolves every workspace in snapshot order.
 5. It gates again and atomically installs the authoritative snapshot and resolved-project map.
    Hints for workspace ids absent from the new snapshot are pruned in the same cache update.
-6. It preserves snapshot order while deduplicating projects by Git root. Each root not already in
-   the daemon's generation-local `ensuredGitRoots` is gated and passed to `ensureProject`.
+6. It preserves snapshot order while deduplicating projects by project path. Each path not already in
+   the daemon's generation-local `ensuredProjectPaths` is gated and passed to `ensureProject`.
 7. If the snapshot has a focused workspace with a resolved project, and its
-   `{ workspaceId, gitRoot }` differs from `lastSuccessful`, the daemon gates and calls
+   `{ workspaceId, projectPath }` differs from `lastSuccessful`, the daemon gates and calls
    `focusProject`.
 
 ### Project resolution
@@ -78,7 +78,8 @@ For each `WorkspaceRecord`:
 2. Otherwise the matching plugin hint is the fallback and sets source `"plugin"`.
 3. The selected value is resolved to an absolute path.
 4. Filesystem `stat` must report a directory.
-5. The daemon invokes shell-free
+5. In the default `directory` mode, that absolute directory becomes `projectPath` directly, without
+   Git or a nested-repository scan. In the opt-in `git-root` mode, the daemon invokes shell-free
    `git -C <candidate> rev-parse --show-toplevel` and resolves its output to the canonical absolute
    Git root.
 
@@ -88,7 +89,7 @@ collapsed by repository identity.
 
 ### Success and retry state
 
-An ensure failure logs `workspace_sync_failed`, is not added to `ensuredGitRoots`, and does not stop
+An ensure failure logs `workspace_sync_failed`, is not added to `ensuredProjectPaths`, and does not stop
 later roots in the same pass. A later trigger retries that root. An ensure success is recorded only
 if its generation is still live.
 
@@ -97,7 +98,7 @@ retries it. A focus success is recorded only if its generation is still live. If
 finishes after its generation becomes stale, the completion neither mutates state nor logs
 `workspace_sync_succeeded`.
 
-The daemon's `ensuredGitRoots` is reset on generation changes. The Zed adapter has a separate
+The daemon's `ensuredProjectPaths` is reset on generation changes. The Zed adapter has a separate
 adapter-lifetime successful-root cache, so the daemon may re-request an ensure after reconnect while
 the adapter safely suppresses a redundant process call it already completed.
 

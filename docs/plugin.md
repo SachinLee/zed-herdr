@@ -18,8 +18,7 @@ from the Effect synchronization service graph.
 - `workspace.created`
 - `workspace.focused`
 
-Both execute `bun ./dist/index.js hook`. The manifest's `daemon` pane executes
-`bun ./dist/index.js daemon`, is titled `Zed Workspace Sync`, and uses placement `tab`.
+Both execute `bun ./dist/index.js hook`, which starts a detached daemon when needed; no pane is declared.
 The manifest also declares the workspace-scoped `toggle` action, which executes
 `bun ./dist/index.js toggle` and pauses or resumes the live daemon without disabling the plugin.
 HerdR keybindings are user configuration, not plugin-manifest fields. Install the binding in
@@ -55,7 +54,7 @@ incomplete values produce no I/O and return exactly:
 
 ### Lock and control-path security
 
-The contender lock is `${controlSocketPath}.lock`. Its directory must be owner-controlled mode
+On POSIX, the contender lock is `${controlSocketPath}.lock`. Its directory must be owner-controlled mode
 `0700`; its single token owner file must be a regular, non-symlink owner file mode `0600`. A lock
 becomes eligible for takeover after 5,000 ms, but removal occurs only after stable directory inode,
 token, and owner-file inode revalidation. Release repeats identity checks and removes only the
@@ -77,6 +76,23 @@ Preparation refuses a live socket. An orphan is probed twice, identity-checked, 
 a quarantine name, revalidated, and only then removed. Races fail closed or restore the preserved
 entry without replacing a winner. Server shutdown likewise removes only the inode it bound and
 restores a replacement without clobbering it.
+
+On Windows, the control endpoint is a named pipe derived from the normalized HerdR marker path
+and current account SID.
+Named pipes have no stable filesystem inode or Unix permissions, so the POSIX checks above do not
+apply. Bun creates the pipe using Windows' default pipe DACL; control requests require write
+access. The client reads the pipe object's owner SID using Windows APIs before connecting and
+refuses a foreign owner or an unverifiable endpoint. The inspection uses a separate handle from
+the Bun connection, so it does not prevent replacement between inspection and connection. The
+implementation does not inspect the pipe DACL. A same-account process can occupy the name before
+startup and impersonate the daemon, so this boundary assumes a trusted local Windows account
+environment. Never treat the daemon's JSON identity as authentication.
+
+Windows hook locks live beneath `%LOCALAPPDATA%\zed-herdr\locks` (with a user-profile fallback).
+Without either root, hook startup fails closed. They rely on the state directory's existing Windows ACL. A completed candidate
+file is published without replacing an existing lock. Takeover and release recheck file identity
+and token; the POSIX socket quarantine procedure is not used for named pipes. Endpoint shutdown
+stops the owned listener and leaves removal of the pipe name to Windows.
 
 ### Wire protocol and application bridge
 
@@ -143,30 +159,7 @@ through the captured runtime.
 
 ### Startup state machine
 
-`runHook` creates one deadline 1,500 ms from startup. Directory preparation, initial notification,
-lock acquisition, pane open, and readiness notification all consume that same deadline:
-
-1. Prepare and validate the control directory before attempting notification.
-2. Notify the existing daemon. Success returns `Notified` with `openedPane: false`.
-3. Only `ControlUnavailable` enters the contender path.
-4. Acquire the token lock at `${controlSocketPath}.lock`.
-5. Under the lock, notify again before preparing the socket or opening a pane. A concurrent winner
-   is reused with `openedPane: false`.
-6. After another `ControlUnavailable`, prepare the control socket and open the daemon pane only if
-   still needed.
-7. Poll notification readiness every 25 ms until the same deadline, then publish the hint.
-
-The exact pane argv is:
-
-```text
-herdr plugin pane open --plugin artisann.zed-herdr --entrypoint daemon --placement tab \
-    --workspace <workspaceId> --no-focus
-```
-
-`HERDR_BIN_PATH` may replace the first token. The pane is deliberately unfocused. An
-`AlreadyRunning` discovered while preparing/opening the pane is treated as concurrent reuse only
-around that preparation block; readiness notification still must succeed. Stable token locking,
-the under-lock recheck, and live-socket refusal yield one pane under contention.
+`runHook` and `start` share one 1,500 ms deadline for control preparation, health probes, lock acquisition, log preflight and readiness. Only `ControlUnavailable` permits startup. The contender acquires the token lock, checks health again, prepares the endpoint and log, then starts a detached daemon without a pane. It polls health and releases the lock; a hook publishes its cwd hint before returning. A failed startup cancels only its own child. Repeated `start` calls reuse the live instance.
 
 ## Failure boundaries
 
@@ -178,14 +171,15 @@ The exported errors define the retry/fail-closed boundary precisely:
 "changed_inode" | "lstat_failed" | "probe_failed" | "not_directory" | "unsafe_mode" |
 "unsafe_parent"`. Every variant fails closed.
 - `ControlProtocolError` fails closed; malformed, oversized, trailing, or unexpected daemon
-  responses never trigger pane startup.
-- `AlreadyRunning` is handled only around pane preparation as described above.
-- `HookStartupError.operation` is `"open_pane" | "readiness" | "lock"` and reaches the CLI failure
+  responses never trigger daemon startup.
+- `AlreadyRunning` is handled only around control socket preparation as described above.
+- `HookStartupError.operation` is `"spawn" | "log" | "readiness" | "lock"` and reaches the CLI failure
   path.
 
 Server-side invalid input returns `invalid_request` or `payload_too_large`; synchronous or
 asynchronous notification publication failure returns `server_failure`. Client-side response
-decoding remains strict and owner/inode validation occurs before trusting the peer.
+decoding remains strict. POSIX additionally validates owner/inode before trusting the peer;
+Windows uses the access-control assumptions described above.
 
 ## Implementation and tests
 

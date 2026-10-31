@@ -10,9 +10,19 @@ import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/TestClock";
 import * as TestContext from "effect/TestContext";
+import { resolve } from "node:path";
 
 import { makeZedEditorAdapter } from "../../src/editor/zed.ts";
 import type { EditorAdapterService } from "../../src/services/editor-adapter.ts";
+
+/**
+ * Host-absolute project paths. The adapter validates with the host `node:path`, so tests
+ * must supply Windows drive paths when running on Windows and keep `/repos/...` elsewhere.
+ */
+const repoPath = (name: string): string => resolve("/repos", name);
+const ALPHA = repoPath("alpha");
+const BETA = repoPath("beta");
+const RETRY = repoPath("retry");
 
 interface CommandCall {
     readonly args: ReadonlyArray<string>;
@@ -129,11 +139,9 @@ const withAdapter = <Value, Failure>(
 test("uses the configured executable for exact shell-free Zed argv", async () => {
     const harness = makeExecutor([{}]);
 
-    await withAdapter(harness, (adapter) => adapter.ensureProject("/repos/alpha"), "/tools/zed");
+    await withAdapter(harness, (adapter) => adapter.ensureProject(ALPHA), "/tools/zed");
 
-    expect(harness.calls).toEqual([
-        { command: "/tools/zed", args: ["-e", "/repos/alpha"], shell: false },
-    ]);
+    expect(harness.calls).toEqual([{ command: "/tools/zed", args: ["-e", ALPHA], shell: false }]);
 });
 
 test("drains every stdout chunk before a successful command completes", async () => {
@@ -147,7 +155,7 @@ test("drains every stdout chunk before a successful command completes", async ()
         },
     ]);
 
-    await withAdapter(harness, (adapter) => adapter.ensureProject("/repos/alpha"), "/tools/zed");
+    await withAdapter(harness, (adapter) => adapter.ensureProject(ALPHA), "/tools/zed");
 
     expect(drained).toEqual(stdout);
     expect(harness.kills).toEqual([]);
@@ -156,25 +164,15 @@ test("drains every stdout chunk before a successful command completes", async ()
 test("uses PATH-resolved zed by default without probes or shell commands", async () => {
     const harness = makeExecutor([{}]);
 
-    await withAdapter(
-        harness,
-        (adapter) => adapter.focusProject("/repos/alpha"),
-        undefined,
-        "linux",
-    );
+    await withAdapter(harness, (adapter) => adapter.focusProject(ALPHA), undefined, "linux");
 
-    expect(harness.calls).toEqual([{ command: "zed", args: ["-e", "/repos/alpha"], shell: false }]);
+    expect(harness.calls).toEqual([{ command: "zed", args: ["-e", ALPHA], shell: false }]);
 });
 
 test("uses the macOS bundled CLI only after PATH zed is not found", async () => {
     const harness = makeExecutor([{ startError: notFound("zed") }, {}]);
 
-    await withAdapter(
-        harness,
-        (adapter) => adapter.focusProject("/repos/alpha"),
-        undefined,
-        "darwin",
-    );
+    await withAdapter(harness, (adapter) => adapter.focusProject(ALPHA), undefined, "darwin");
 
     expect(harness.calls.map((call) => call.command)).toEqual([
         "zed",
@@ -195,7 +193,7 @@ test("does not fall back for configured binaries, non-macOS hosts, or non-not-fo
     ] as const) {
         const result = await withAdapter(
             harness,
-            (adapter) => adapter.ensureProject("/repos/alpha").pipe(Effect.either),
+            (adapter) => adapter.ensureProject(ALPHA).pipe(Effect.either),
             executable,
             platform,
         );
@@ -213,8 +211,8 @@ test("serializes registrations and caches only successful ensure roots", async (
             Effect.provideService(CommandExecutor.CommandExecutor, harness.executor),
             Effect.flatMap((adapter) =>
                 Effect.gen(function* () {
-                    const first = yield* adapter.ensureProject("/repos/alpha").pipe(Effect.fork);
-                    const second = yield* adapter.focusProject("/repos/beta").pipe(Effect.fork);
+                    const first = yield* adapter.ensureProject(ALPHA).pipe(Effect.fork);
+                    const second = yield* adapter.focusProject(BETA).pipe(Effect.fork);
                     yield* Effect.yieldNow();
                     yield* Effect.yieldNow();
                     expect(harness.calls).toHaveLength(1);
@@ -222,22 +220,17 @@ test("serializes registrations and caches only successful ensure roots", async (
                     yield* Deferred.succeed(gate, CommandExecutor.ExitCode(0));
                     yield* Fiber.join(first);
                     yield* Fiber.join(second);
-                    yield* adapter.ensureProject("/repos/alpha");
+                    yield* adapter.ensureProject(ALPHA);
 
-                    const failed = yield* adapter.ensureProject("/repos/retry").pipe(Effect.either);
+                    const failed = yield* adapter.ensureProject(RETRY).pipe(Effect.either);
                     expect(failed._tag).toBe("Left");
-                    yield* adapter.ensureProject("/repos/retry");
+                    yield* adapter.ensureProject(RETRY);
                 }),
             ),
         ),
     );
 
-    expect(harness.calls.map((call) => call.args[1])).toEqual([
-        "/repos/alpha",
-        "/repos/beta",
-        "/repos/retry",
-        "/repos/retry",
-    ]);
+    expect(harness.calls.map((call) => call.args[1])).toEqual([ALPHA, BETA, RETRY, RETRY]);
 });
 
 test("reports nonzero exits with exit code and final stderr tail", async () => {
@@ -249,7 +242,7 @@ test("reports nonzero exits with exit code and final stderr tail", async () => {
     ]);
 
     const result = await withAdapter(harness, (adapter) =>
-        adapter.focusProject("/repos/alpha").pipe(Effect.either),
+        adapter.focusProject(ALPHA).pipe(Effect.either),
     );
 
     expect(result._tag).toBe("Left");
@@ -277,9 +270,7 @@ test("kills and awaits the scoped process when the five-second timeout expires",
                 Effect.provideService(CommandExecutor.CommandExecutor, harness.executor),
                 Effect.flatMap((adapter) =>
                     Effect.gen(function* () {
-                        const fiber = yield* adapter
-                            .ensureProject("/repos/alpha")
-                            .pipe(Effect.fork);
+                        const fiber = yield* adapter.ensureProject(ALPHA).pipe(Effect.fork);
                         yield* Effect.yieldNow();
                         yield* TestClock.adjust("5 seconds");
                         const exit = yield* Fiber.await(fiber);
@@ -300,7 +291,7 @@ test("bounds incrementally drained stderr to its final 4096 bytes", async () => 
     const harness = makeExecutor([{ exitCode: 1, stderr: [prefix, suffix] }]);
 
     const result = await withAdapter(harness, (adapter) =>
-        adapter.ensureProject("/repos/alpha").pipe(Effect.either),
+        adapter.ensureProject(ALPHA).pipe(Effect.either),
     );
 
     expect(result._tag).toBe("Left");

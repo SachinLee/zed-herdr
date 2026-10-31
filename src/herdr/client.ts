@@ -6,7 +6,6 @@ import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as Runtime from "effect/Runtime";
 import * as Stream from "effect/Stream";
-import { homedir } from "node:os";
 
 import {
     StaleWorkspaceGeneration,
@@ -34,29 +33,19 @@ import {
     type SessionSnapshot,
     validateHerdRProtocol,
 } from "./protocol.ts";
+import {
+    connectHerdRChannel,
+    resolveHerdRSocketPath,
+    type HerdRChannel,
+} from "./windows-transport.ts";
 
 const retryInitialDelayMs = 100;
 const retryMaximumDelayMs = 5_000;
 const BOOTSTRAP_TIMEOUT_MS = 5_000;
 const maxLogCauseLength = 4_096;
 
-/** Resolve HerdR's Unix socket without probing or mutating the filesystem. */
-export const resolveHerdRSocketPath = (environment: NodeJS.ProcessEnv = process.env): string => {
-    const configuredSocket = environment.HERDR_SOCKET_PATH;
-    if (configuredSocket !== undefined && configuredSocket.length > 0) {
-        return configuredSocket;
-    }
-
-    const configHome =
-        environment.XDG_CONFIG_HOME && environment.XDG_CONFIG_HOME.length > 0
-            ? environment.XDG_CONFIG_HOME
-            : `${environment.HOME ?? homedir()}/.config`;
-    const session = environment.HERDR_SESSION;
-
-    return session !== undefined && session.length > 0
-        ? `${configHome}/herdr/sessions/${session}/herdr.sock`
-        : `${configHome}/herdr/herdr.sock`;
-};
+/** Resolve HerdR's socket without probing or mutating the filesystem. */
+export { resolveHerdRSocketPath };
 
 export interface HerdRProtocolStatus {
     readonly protocol: number | null;
@@ -114,8 +103,8 @@ const protocolError = (
     });
 
 /** The protocol union is the sole outbound method allowlist. */
-const writeReadOnlyRequest = (socket: Bun.Socket, request: HerdRRequest): void => {
-    socket.write(`${JSON.stringify(request)}\n`);
+const writeReadOnlyRequest = (channel: HerdRChannel, request: HerdRRequest): void => {
+    channel.write(`${JSON.stringify(request)}\n`);
 };
 
 const decodeGeneration = (value: number): WorkspaceGeneration =>
@@ -147,9 +136,9 @@ class LiveHerdRClient implements HerdRClientService {
     #negotiatedProtocol: number | null = null;
     #warnedBeyondTested = false;
     #liveGeneration: WorkspaceGeneration | null = null;
-    #subscription: Bun.Socket | null = null;
+    #subscription: HerdRChannel | null = null;
     #finishSubscription: ((cause: unknown) => void) | null = null;
-    #requests = new Map<WorkspaceGeneration, Set<Bun.Socket>>();
+    #requests = new Map<WorkspaceGeneration, Set<HerdRChannel>>();
     #requestCancellers = new Map<WorkspaceGeneration, Set<(reason: HerdRClientError) => void>>();
 
     #stopped = false;
@@ -312,7 +301,7 @@ class LiveHerdRClient implements HerdRClientService {
         const finished = Promise.withResolvers<void>();
         const id = crypto.randomUUID();
         const decoder = new NdjsonDecoder();
-        let socket: Bun.Socket | null = null;
+        let socket: HerdRChannel | null = null;
         let acked = false;
         let settled = false;
         let clearAcknowledgementTimeout = (): void => {};
@@ -423,28 +412,24 @@ class LiveHerdRClient implements HerdRClientService {
             finish(cause);
         };
 
-        void Bun.connect({
-            unix: this.socketPath,
-            socket: {
-                binaryType: "uint8array",
-                data: (_socket, data) => {
-                    try {
-                        for (const frame of decoder.push(data)) {
-                            acceptFrame(frame);
-                        }
-                    } catch (cause) {
-                        if (cause instanceof NdjsonFramingError) {
-                            finish(cause);
-                        } else {
-                            finish(transportError("read", cause));
-                        }
+        void connectHerdRChannel(this.socketPath, {
+            data: (data) => {
+                try {
+                    for (const frame of decoder.push(data)) {
+                        acceptFrame(frame);
                     }
-                },
-                close: (_socket, error) =>
-                    finishAfterDecoderEnd(error ?? new Error("HerdR subscription closed")),
-                end: () => finishAfterDecoderEnd(new Error("HerdR subscription ended")),
-                error: (_socket, error) => finish(error),
+                } catch (cause) {
+                    if (cause instanceof NdjsonFramingError) {
+                        finish(cause);
+                    } else {
+                        finish(transportError("read", cause));
+                    }
+                }
             },
+            close: (error) =>
+                finishAfterDecoderEnd(error ?? new Error("HerdR subscription closed")),
+            end: () => finishAfterDecoderEnd(new Error("HerdR subscription ended")),
+            error: (error) => finish(error),
         }).then(
             (connected) => {
                 socket = connected;
@@ -465,7 +450,7 @@ class LiveHerdRClient implements HerdRClientService {
         const result = Promise.withResolvers<SessionSnapshot>();
         const id = crypto.randomUUID();
         const decoder = new NdjsonDecoder();
-        let socket: Bun.Socket | null = null;
+        let socket: HerdRChannel | null = null;
         let completed = false;
 
         const remove = (): void => {
@@ -560,30 +545,25 @@ class LiveHerdRClient implements HerdRClientService {
             settle(Either.left(transportError("read", cause)));
         };
 
-        void Bun.connect({
-            unix: this.socketPath,
-            socket: {
-                binaryType: "uint8array",
-                data: (_socket, data) => {
-                    try {
-                        for (const frame of decoder.push(data)) {
-                            acceptFrame(frame);
-                        }
-                    } catch (cause) {
-                        settle(
-                            Either.left(
-                                cause instanceof NdjsonFramingError
-                                    ? protocolError("decode", cause)
-                                    : transportError("read", cause),
-                            ),
-                        );
+        void connectHerdRChannel(this.socketPath, {
+            data: (data) => {
+                try {
+                    for (const frame of decoder.push(data)) {
+                        acceptFrame(frame);
                     }
-                },
-                close: (_socket, error) =>
-                    finishAfterDecoderEnd(error ?? new Error("HerdR request closed")),
-                end: () => finishAfterDecoderEnd(new Error("HerdR request ended")),
-                error: (_socket, error) => settle(Either.left(transportError("read", error))),
+                } catch (cause) {
+                    settle(
+                        Either.left(
+                            cause instanceof NdjsonFramingError
+                                ? protocolError("decode", cause)
+                                : transportError("read", cause),
+                        ),
+                    );
+                }
             },
+            close: (error) => finishAfterDecoderEnd(error ?? new Error("HerdR request closed")),
+            end: () => finishAfterDecoderEnd(new Error("HerdR request ended")),
+            error: (error) => settle(Either.left(transportError("read", error))),
         }).then(
             (connected) => {
                 socket = connected;

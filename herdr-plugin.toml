@@ -2,7 +2,7 @@ id = "artisann.zed-herdr"
 name = "Zed Workspace Sync"
 version = "0.1.0"
 min_herdr_version = "0.7.3"
-platforms = ["macos", "linux"]
+platforms = ["macos", "linux", "windows"]
 
 [[build]]
 command = ["bun", "install", "--frozen-lockfile"]
@@ -24,9 +24,3 @@ command = ["bun", "./dist/index.js", "hook"]
 [[events]]
 on = "workspace.focused"
 command = ["bun", "./dist/index.js", "hook"]
-
-[[panes]]
-id = "daemon"
-title = "Zed Workspace Sync"
-placement = "tab"
-command = ["bun", "./dist/index.js", "daemon"]

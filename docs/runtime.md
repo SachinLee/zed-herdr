@@ -14,7 +14,7 @@ and the separate local control server. Synchronization policy remains in the
 [`runCli`](../src/cli.ts) accepts exactly one argument and exposes this exact usage literal:
 
 ```text
-Usage: zed-herdr <daemon|hook|health|toggle>
+Usage: zed-herdr <daemon|hook|health|start|stop|toggle>
 ```
 
 The one argument dispatches as follows:
@@ -24,6 +24,8 @@ The one argument dispatches as follows:
 | `daemon` | `decodeAppConfig` → `runDaemon`                                              |
 | `hook`   | Promise-based `runHook` wrapped at the CLI boundary                          |
 | `health` | Promise-based `healthControl` plus daemon-identity validation                |
+| `start`  | Ensure a detached daemon is ready, or reuse the existing instance            |
+| `stop`   | Request cleanup through the validated control endpoint and await closure     |
 | `toggle` | Promise-based `toggleControl`, printing the daemon's resulting enabled state |
 
 Missing, extra, or unknown arguments print the usage and set exit status `2`.
@@ -33,6 +35,11 @@ Missing, extra, or unknown arguments print the usage and set exit status `2`.
 [`decodeAppConfig`](../src/config.ts) reads optional `ZED_BIN`, trims it, and rejects an explicitly
 present value that becomes empty. An absent value remains `undefined`, allowing the Zed adapter to
 resolve `zed` through `PATH`.
+
+It also reads `ZED_HERDR_PROJECT_MODE`, defaulting to `directory` when absent. Explicit values are
+trimmed and must be `git-root` or `directory`; empty or unknown values fail with a bounded
+`ConfigurationError`. `runDaemon` passes the mode to `makeSyncDaemonWithProjectMode`; the exported
+`makeSyncDaemon` retains the default Git-root behavior.
 
 `makeAppLayer` composes the daemon dependencies:
 
@@ -66,7 +73,7 @@ Its socket safety and request protocol are documented with the [plugin boundary]
 
 ## Failure boundaries
 
-`hook`, `health`, and `toggle` failures pass through `commandFailed`: it renders an error message,
+`hook`, `health`, `start`, `stop`, and `toggle` failures pass through `commandFailed`: it renders an error message,
 keeps at most the last 4,096 characters, prints it, and sets exit status `1`. `health` also uses
 that path if the response carries the wrong daemon identity.
 

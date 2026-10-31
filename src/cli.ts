@@ -6,11 +6,12 @@ import {
     CONTROL_DAEMON_IDENTITY,
     controlSocketPath,
     healthControl,
+    stopControl,
     toggleControl,
 } from "./plugin/control.ts";
-import { runHook } from "./plugin/hook.ts";
+import { ensureDaemon, runHook } from "./plugin/hook.ts";
 
-export const USAGE = "Usage: zed-herdr <daemon|hook|health|toggle>";
+export const USAGE = "Usage: zed-herdr <daemon|hook|health|start|stop|toggle>";
 
 const invalidCommand = Effect.sync(() => {
     console.error(USAGE);
@@ -65,6 +66,33 @@ const runToggle = (environment: NodeJS.ProcessEnv) =>
         }),
     );
 
+const runStart = (environment: NodeJS.ProcessEnv) =>
+    Effect.tryPromise({
+        try: () => ensureDaemon({ environment }),
+        catch: (cause) => cause,
+    }).pipe(
+        Effect.matchEffect({
+            onFailure: commandFailed,
+            onSuccess: (result) =>
+                Effect.sync(() => console.log(JSON.stringify({ ok: true, ...result }))),
+        }),
+    );
+const runStop = (environment: NodeJS.ProcessEnv) =>
+    Effect.tryPromise({
+        try: () => stopControl(controlSocketPath(environment)),
+        catch: (cause) => cause,
+    }).pipe(
+        Effect.matchEffect({
+            onFailure: commandFailed,
+            onSuccess: (daemon) =>
+                daemon.identity === CONTROL_DAEMON_IDENTITY
+                    ? Effect.sync(() => {
+                          console.log(JSON.stringify({ ok: true, daemon }));
+                      })
+                    : commandFailed("Control socket returned the wrong daemon identity"),
+        }),
+    );
+
 export const runCli = (
     arguments_: ReadonlyArray<string> = process.argv.slice(2),
     environment: NodeJS.ProcessEnv = process.env,
@@ -81,6 +109,10 @@ export const runCli = (
             return runHealth(environment);
         case "hook":
             return runPluginHook(environment);
+        case "start":
+            return runStart(environment);
+        case "stop":
+            return runStop(environment);
         case "toggle":
             return runToggle(environment);
         default:

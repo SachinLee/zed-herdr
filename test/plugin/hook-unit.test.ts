@@ -1,16 +1,28 @@
-import { expect, test, vi } from "bun:test";
+import { expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-import { decodeHookNotification, HookStartupError, runHook } from "../../src/plugin/hook.ts";
-import type { HookControlApi } from "../../src/plugin/hook.ts";
 import {
+    decodeHookNotification,
+    ensureDaemon,
+    HookStartupError,
+    runHook,
+} from "../../src/plugin/hook.ts";
+import type { HookControlApi } from "../../src/plugin/hook.ts";
+import type { BackgroundDaemon, DaemonSpawner } from "../../src/plugin/daemon-process.ts";
+import { preflightDaemonLog } from "../../src/plugin/daemon-log.ts";
+import {
+    CONTROL_DAEMON_IDENTITY,
     ControlProtocolError,
     ControlUnavailable,
     UnsafeControlSocket,
+    controlLockPath,
 } from "../../src/plugin/control.ts";
-import type { HookNotification } from "../../src/plugin/protocol.ts";
+import type { DaemonHealth, HookNotification } from "../../src/plugin/protocol.ts";
+import { isWindowsControlPlatform } from "../../src/plugin/windows-pipe.ts";
+
+const posixTest = test.skipIf(isWindowsControlPlatform());
 
 const expectNotification = (
     notification: HookNotification | undefined,
@@ -24,6 +36,10 @@ const expectNotification = (
 };
 
 const hookEnvironment = (overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+    // Windows derives the hook lock file from the per-account state root, so the
+    // test environment must carry the same profile variables a real hook sees.
+    LOCALAPPDATA: process.env.LOCALAPPDATA,
+    USERPROFILE: process.env.USERPROFILE,
     HERDR_PLUGIN_EVENT_JSON: JSON.stringify({
         data: { workspace: { workspace_id: "event-workspace" } },
     }),
@@ -37,17 +53,56 @@ const unavailable = async (): Promise<void> => {
     throw new ControlUnavailable("/control.sock", "connect");
 };
 
+const daemonHealth = (): DaemonHealth => ({
+    identity: CONTROL_DAEMON_IDENTITY,
+    paneId: null,
+    pid: 4_242,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    protocol: null,
+    beyondTested: false,
+});
+
+const unavailableHealth: HookControlApi["healthControl"] = async (path) => {
+    throw new ControlUnavailable(path, "connect");
+};
+
 const controlFor = (
     path: string,
     notify: HookControlApi["notifyControl"],
     prepare: HookControlApi["prepareControlSocket"] = async () => undefined,
     prepareDirectory: HookControlApi["prepareControlSocketDirectory"] = async () => undefined,
+    health: HookControlApi["healthControl"] = unavailableHealth,
 ): HookControlApi => ({
     controlSocketPath: () => path,
+    healthControl: health,
     notifyControl: notify,
     prepareControlSocket: prepare,
     prepareControlSocketDirectory: prepareDirectory,
 });
+
+const neverExits = (): Promise<number> => new Promise<number>(() => undefined);
+
+const daemonFor = (
+    options: { readonly exit?: Promise<number>; readonly kill?: () => void } = {},
+): BackgroundDaemon => ({
+    pid: 4_242,
+    exited: options.exit ?? neverExits(),
+    kill: options.kill ?? (() => undefined),
+});
+
+const spawnFor =
+    (callback: () => void = () => undefined): DaemonSpawner =>
+    () => {
+        callback();
+        return daemonFor();
+    };
+
+/** Bind the hook lock and daemon log to the test directory on every platform. */
+const hookEnvironmentFor = (
+    directory: string,
+    overrides: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv =>
+    hookEnvironment({ LOCALAPPDATA: directory, USERPROFILE: directory, ...overrides });
 
 test("declares the official HerdR v0.7.3 plugin manifest", async () => {
     const manifest = await readFile(join(import.meta.dir, "../../herdr-plugin.toml"), "utf8");
@@ -57,7 +112,7 @@ test("declares the official HerdR v0.7.3 plugin manifest", async () => {
         name: "Zed Workspace Sync",
         version: "0.1.0",
         min_herdr_version: "0.7.3",
-        platforms: ["macos", "linux"],
+        platforms: ["macos", "linux", "windows"],
         build: [
             { command: ["bun", "install", "--frozen-lockfile"] },
             { command: ["bun", "run", "build"] },
@@ -73,14 +128,6 @@ test("declares the official HerdR v0.7.3 plugin manifest", async () => {
         events: [
             { on: "workspace.created", command: ["bun", "./dist/index.js", "hook"] },
             { on: "workspace.focused", command: ["bun", "./dist/index.js", "hook"] },
-        ],
-        panes: [
-            {
-                id: "daemon",
-                title: "Zed Workspace Sync",
-                placement: "tab",
-                command: ["bun", "./dist/index.js", "daemon"],
-            },
         ],
     });
 });
@@ -157,23 +204,29 @@ test("rejects invalid or incomplete event and context hook payload schemas", asy
     }
 });
 
-test("notifies an existing daemon without opening a pane", async () => {
+test("notifies an existing daemon without starting another one", async () => {
     const directory = await temporaryDirectory();
     try {
         const notifications: Array<unknown> = [];
-        let opens = 0;
+        let starts = 0;
         const result = await runHook({
-            control: controlFor(join(directory, "control.sock"), async (_path, notification) => {
-                notifications.push(notification);
+            control: controlFor(
+                join(directory, "control.sock"),
+                async (_path, notification) => {
+                    notifications.push(notification);
+                },
+                undefined,
+                undefined,
+                async () => daemonHealth(),
+            ),
+            environment: hookEnvironmentFor(directory),
+            spawnDaemon: spawnFor(() => {
+                starts += 1;
             }),
-            environment: hookEnvironment(),
-            openPane: async () => {
-                opens += 1;
-            },
         });
 
-        expect(result).toEqual({ _tag: "Notified", openedPane: false });
-        expect(opens).toBe(0);
+        expect(result).toEqual({ _tag: "Notified", startedDaemon: false });
+        expect(starts).toBe(0);
         expect(notifications).toEqual([{ workspaceId: "event-workspace", cwd: "/repos/event" }]);
     } finally {
         await rm(directory, { recursive: true, force: true });
@@ -186,62 +239,80 @@ test("bounds a stalled existing control socket within the single hook deadline",
         const path = join(directory, "control.sock");
         const timeouts: Array<number | undefined> = [];
         let now = 0;
-        let opens = 0;
-        const control = controlFor(path, async (_path, _notification, timeoutMs) => {
-            timeouts.push(timeoutMs);
-            now += timeoutMs ?? 0;
-            await unavailable();
-        });
+        let starts = 0;
+        const control = controlFor(
+            path,
+            unavailable,
+            undefined,
+            undefined,
+            async (target, timeoutMs) => {
+                timeouts.push(timeoutMs);
+                now += timeoutMs ?? 0;
+                throw new ControlUnavailable(target, "timeout");
+            },
+        );
 
         await expect(
             runHook({
                 control,
-                environment: hookEnvironment(),
+                environment: hookEnvironmentFor(directory),
                 now: () => now,
-                openPane: async () => {
-                    opens += 1;
-                },
+                spawnDaemon: spawnFor(() => {
+                    starts += 1;
+                }),
             }),
         ).rejects.toMatchObject({ _tag: "HookStartupError", operation: "readiness" });
         expect(timeouts).toEqual([1_500]);
-        expect(opens).toBe(0);
+        expect(starts).toBe(0);
     } finally {
         await rm(directory, { recursive: true, force: true });
     }
 });
 
-test("does not invoke an opener after the shared deadline expires", async () => {
+test("does not spawn a daemon after the shared deadline expires", async () => {
     const directory = await temporaryDirectory();
     try {
         const path = join(directory, "control.sock");
         let now = 0;
+        let probes = 0;
+        let starts = 0;
         let notifications = 0;
-        let opens = 0;
-        const control = controlFor(path, async () => {
-            notifications += 1;
-            if (notifications === 2) {
-                now = 1_500;
-            }
-            await unavailable();
-        });
+        const control = controlFor(
+            path,
+            async () => {
+                notifications += 1;
+                await unavailable();
+            },
+            undefined,
+            undefined,
+            async (target) => {
+                probes += 1;
+                if (probes === 2) {
+                    now = 1_500;
+                }
+                throw new ControlUnavailable(target, "connect");
+            },
+        );
 
         await expect(
             runHook({
                 control,
-                environment: hookEnvironment(),
+                environment: hookEnvironmentFor(directory),
                 now: () => now,
-                openPane: async () => {
-                    opens += 1;
-                },
+                spawnDaemon: spawnFor(() => {
+                    starts += 1;
+                }),
             }),
         ).rejects.toMatchObject({ _tag: "HookStartupError", operation: "readiness" });
-        expect(opens).toBe(0);
+        expect(probes).toBe(2);
+        expect(notifications).toBe(0);
+        expect(starts).toBe(0);
     } finally {
         await rm(directory, { recursive: true, force: true });
     }
 });
 
-test("propagates protocol and unsafe control errors without retrying or opening a pane", async () => {
+test("propagates protocol and unsafe control errors without retrying or spawning", async () => {
     const directory = await temporaryDirectory();
     try {
         const path = join(directory, "control.sock");
@@ -249,121 +320,126 @@ test("propagates protocol and unsafe control errors without retrying or opening 
             new ControlProtocolError(path, "malformed response"),
             new UnsafeControlSocket(path, "unsafe_mode"),
         ]) {
-            let notifications = 0;
-            let opens = 0;
+            let probes = 0;
+            let starts = 0;
 
             await expect(
                 runHook({
-                    control: controlFor(path, async () => {
-                        notifications += 1;
-                        throw failure;
+                    control: controlFor(
+                        path,
+                        async () => {
+                            throw failure;
+                        },
+                        undefined,
+                        undefined,
+                        async () => {
+                            probes += 1;
+                            throw failure;
+                        },
+                    ),
+                    environment: hookEnvironmentFor(directory),
+                    spawnDaemon: spawnFor(() => {
+                        starts += 1;
                     }),
-                    environment: hookEnvironment(),
-                    openPane: async () => {
-                        opens += 1;
-                    },
                 }),
             ).rejects.toBe(failure);
-            expect(notifications).toBe(1);
-            expect(opens).toBe(0);
+            expect(probes).toBe(1);
+            expect(starts).toBe(0);
         }
     } finally {
         await rm(directory, { recursive: true, force: true });
     }
 });
 
-test("rejects an unsafe control parent before attempting notification or pane opening", async () => {
+test("rejects an unsafe control parent before probing or starting a daemon", async () => {
     const directory = await temporaryDirectory();
     try {
         const path = join(directory, "control.sock");
         const failure = new UnsafeControlSocket(path, "unsafe_parent");
         let directoryPreparations = 0;
-        let notifications = 0;
-        let opens = 0;
+        let probes = 0;
+        let starts = 0;
 
         await expect(
             runHook({
                 control: controlFor(
                     path,
                     async () => {
-                        notifications += 1;
+                        throw new ControlUnavailable(path, "connect");
                     },
                     async () => undefined,
                     async () => {
                         directoryPreparations += 1;
                         throw failure;
                     },
+                    async () => {
+                        probes += 1;
+                        return daemonHealth();
+                    },
                 ),
-                environment: hookEnvironment(),
-                openPane: async () => {
-                    opens += 1;
-                },
+                environment: hookEnvironmentFor(directory),
+                spawnDaemon: spawnFor(() => {
+                    starts += 1;
+                }),
             }),
         ).rejects.toBe(failure);
         expect(directoryPreparations).toBe(1);
-        expect(notifications).toBe(0);
-        expect(opens).toBe(0);
+        expect(probes).toBe(0);
+        expect(starts).toBe(0);
     } finally {
         await rm(directory, { recursive: true, force: true });
     }
 });
 
-test("opens the exact unfocused daemon argv once while twenty hooks contend", async () => {
+test("starts exactly one detached daemon while twenty hooks contend", async () => {
     const directory = await temporaryDirectory();
     try {
         const path = join(directory, "control.sock");
-        const opening = Promise.withResolvers<void>();
-        const opened = Promise.withResolvers<void>();
-        const argv: Array<ReadonlyArray<string>> = [];
+        const spawning = Promise.withResolvers<void>();
         const notifications: Array<unknown> = [];
         let ready = false;
-        const control = controlFor(path, async (_path, notification) => {
-            if (!ready) {
-                await unavailable();
-            }
-            notifications.push(notification);
-        });
+        let starts = 0;
+        const control = controlFor(
+            path,
+            async (_path, notification) => {
+                if (!ready) {
+                    await unavailable();
+                }
+                notifications.push(notification);
+            },
+            undefined,
+            undefined,
+            async (target) => {
+                if (!ready) {
+                    throw new ControlUnavailable(target, "connect");
+                }
+                return daemonHealth();
+            },
+        );
 
         const runs = Array.from({ length: 20 }, () =>
             runHook({
                 control,
-                environment: hookEnvironment({ HERDR_BIN_PATH: "/custom/herdr" }),
-                openPane: async (command) => {
-                    argv.push(command);
-                    opening.resolve();
-                    await opened.promise;
-                    ready = true;
+                environment: hookEnvironmentFor(directory, { HERDR_SESSION: "work" }),
+                spawnDaemon: () => {
+                    starts += 1;
+                    spawning.resolve();
+                    return daemonFor();
                 },
             }),
         );
-        await opening.promise;
-        opened.resolve();
+        await spawning.promise;
+        ready = true;
 
         expect(await Promise.all(runs)).toHaveLength(20);
-        expect(argv).toEqual([
-            [
-                "/custom/herdr",
-                "plugin",
-                "pane",
-                "open",
-                "--plugin",
-                "artisann.zed-herdr",
-                "--entrypoint",
-                "daemon",
-                "--placement",
-                "tab",
-                "--workspace",
-                "event-workspace",
-                "--no-focus",
-            ],
-        ]);
+        expect(starts).toBe(1);
         expect(notifications).toHaveLength(20);
     } finally {
         await rm(directory, { recursive: true, force: true });
     }
 });
 
-test("fails closed on a non-owner-only canonical lock directory", async () => {
+posixTest("fails closed on a non-owner-only canonical lock directory", async () => {
     const directory = await temporaryDirectory();
     try {
         const path = join(directory, "control.sock");
@@ -374,7 +450,7 @@ test("fails closed on a non-owner-only canonical lock directory", async () => {
         await expect(
             runHook({
                 control: controlFor(path, unavailable),
-                environment: hookEnvironment(),
+                environment: hookEnvironmentFor(directory),
             }),
         ).rejects.toMatchObject({ _tag: "HookStartupError", operation: "lock" });
     } finally {
@@ -382,7 +458,7 @@ test("fails closed on a non-owner-only canonical lock directory", async () => {
     }
 });
 
-test("rejects invalid and incomplete lock owner schemas", async () => {
+posixTest("rejects invalid and incomplete lock owner schemas", async () => {
     const directory = await temporaryDirectory();
     try {
         const invalidLocks = [
@@ -401,24 +477,52 @@ test("rejects invalid and incomplete lock owner schemas", async () => {
             });
             await chmod(join(lockPath, `${token}.json`), 0o600);
 
-            let opens = 0;
+            let starts = 0;
             await expect(
                 runHook({
                     control: controlFor(path, unavailable),
-                    environment: hookEnvironment(),
-                    openPane: async () => {
-                        opens += 1;
-                    },
+                    environment: hookEnvironmentFor(directory),
+                    spawnDaemon: spawnFor(() => {
+                        starts += 1;
+                    }),
                 }),
             ).rejects.toMatchObject({ _tag: "HookStartupError", operation: "lock" });
-            expect(opens).toBe(0);
+            expect(starts).toBe(0);
         }
     } finally {
         await rm(directory, { recursive: true, force: true });
     }
 });
 
-test("takes over a stale lock and never releases a resumed holder token", async () => {
+test.skipIf(!isWindowsControlPlatform())(
+    "rejects an unparseable Windows lock owner file instead of taking it over",
+    async () => {
+        const directory = await temporaryDirectory();
+        const environment = hookEnvironmentFor(directory);
+        try {
+            const path = join(directory, "control.sock");
+            const lockPath = controlLockPath(path, environment);
+            await mkdir(dirname(lockPath), { recursive: true });
+            await writeFile(lockPath, JSON.stringify({ pid: "not-an-integer", token: "bad" }));
+
+            let starts = 0;
+            await expect(
+                runHook({
+                    control: controlFor(path, unavailable),
+                    environment,
+                    spawnDaemon: spawnFor(() => {
+                        starts += 1;
+                    }),
+                }),
+            ).rejects.toMatchObject({ _tag: "HookStartupError", operation: "lock" });
+            expect(starts).toBe(0);
+        } finally {
+            await rm(directory, { recursive: true, force: true });
+        }
+    },
+);
+
+posixTest("takes over a stale lock and never releases a resumed holder token", async () => {
     const directory = await temporaryDirectory();
     try {
         const path = join(directory, "control.sock");
@@ -432,24 +536,38 @@ test("takes over a stale lock and never releases a resumed holder token", async 
         );
         await chmod(join(lockPath, "stale-token.json"), 0o600);
         let ready = false;
-        const control = controlFor(path, async () => {
-            if (!ready) {
-                await unavailable();
-            }
-        });
+        const control = controlFor(
+            path,
+            async () => {
+                if (!ready) {
+                    await unavailable();
+                }
+            },
+            undefined,
+            undefined,
+            async (target) => {
+                if (!ready) {
+                    throw new ControlUnavailable(target, "connect");
+                }
+                return daemonHealth();
+            },
+        );
 
         await runHook({
             control,
-            environment: hookEnvironment(),
+            environment: hookEnvironmentFor(directory),
             token: () => "owner-token",
-            openPane: async () => {
-                await rm(join(lockPath, "owner-token.json"));
-                await writeFile(
-                    join(lockPath, "resumed-token.json"),
-                    JSON.stringify({ pid: 2, token: "resumed-token", createdAt: Date.now() }),
-                );
-                await chmod(join(lockPath, "resumed-token.json"), 0o600);
-                ready = true;
+            spawnDaemon: () => {
+                void (async () => {
+                    await rm(join(lockPath, "owner-token.json"));
+                    await writeFile(
+                        join(lockPath, "resumed-token.json"),
+                        JSON.stringify({ pid: 2, token: "resumed-token", createdAt: Date.now() }),
+                    );
+                    await chmod(join(lockPath, "resumed-token.json"), 0o600);
+                    ready = true;
+                })();
+                return daemonFor();
             },
         });
 
@@ -463,118 +581,252 @@ test("takes over a stale lock and never releases a resumed holder token", async 
     }
 });
 
-test("takes over a stale empty lock directory without treating a fresh pending directory as stale", async () => {
+posixTest(
+    "takes over a stale empty lock directory without treating a fresh pending directory as stale",
+    async () => {
+        const directory = await temporaryDirectory();
+        try {
+            const path = join(directory, "control.sock");
+            const lockPath = `${path}.lock`;
+            await mkdir(lockPath, { mode: 0o700 });
+            const stale = new Date(Date.now() - 5_001);
+            await utimes(lockPath, stale, stale);
+            let ready = false;
+            let starts = 0;
+
+            await runHook({
+                control: controlFor(
+                    path,
+                    async () => {
+                        if (!ready) {
+                            await unavailable();
+                        }
+                    },
+                    undefined,
+                    undefined,
+                    async (target) => {
+                        if (!ready) {
+                            throw new ControlUnavailable(target, "connect");
+                        }
+                        return daemonHealth();
+                    },
+                ),
+                environment: hookEnvironmentFor(directory),
+                spawnDaemon: spawnFor(() => {
+                    starts += 1;
+                    ready = true;
+                }),
+            });
+
+            expect(starts).toBe(1);
+            await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+        } finally {
+            await rm(directory, { recursive: true, force: true });
+        }
+    },
+);
+
+test("polls readiness through the 1.5-second deadline and releases its lock", async () => {
     const directory = await temporaryDirectory();
     try {
         const path = join(directory, "control.sock");
-        const lockPath = `${path}.lock`;
-        await mkdir(lockPath, { mode: 0o700 });
-        const stale = new Date(Date.now() - 5_001);
-        await utimes(lockPath, stale, stale);
-        let ready = false;
-        let opens = 0;
-
-        await runHook({
-            control: controlFor(path, async () => {
-                if (!ready) {
-                    await unavailable();
-                }
-            }),
-            environment: hookEnvironment(),
-            openPane: async () => {
-                opens += 1;
-                ready = true;
-            },
-        });
-
-        expect(opens).toBe(1);
-        await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    } finally {
-        await rm(directory, { recursive: true, force: true });
-    }
-});
-
-test("retries ControlUnavailable through the 1.5-second readiness deadline and releases its lock", async () => {
-    const directory = await temporaryDirectory();
-    try {
-        const path = join(directory, "control.sock");
+        const environment = hookEnvironmentFor(directory);
         let now = 0;
-        let notifications = 0;
+        let probes = 0;
         let sleeps = 0;
-        let opens = 0;
-        const control = controlFor(path, async () => {
-            notifications += 1;
-            await unavailable();
+        let starts = 0;
+        const control = controlFor(path, unavailable, undefined, undefined, async (target) => {
+            probes += 1;
+            throw new ControlUnavailable(target, "connect");
         });
 
         await expect(
             runHook({
                 control,
-                environment: hookEnvironment(),
+                environment,
                 now: () => now,
                 sleep: async (milliseconds) => {
                     sleeps += 1;
                     now += milliseconds;
                 },
-                openPane: async () => {
-                    opens += 1;
-                },
+                spawnDaemon: spawnFor(() => {
+                    starts += 1;
+                }),
             }),
         ).rejects.toMatchObject({ _tag: "HookStartupError", operation: "readiness" });
         expect(now).toBe(1_500);
         expect(sleeps).toBe(60);
-        expect(notifications).toBe(62);
-        expect(opens).toBe(1);
-        await expect(readFile(`${path}.lock`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+        expect(probes).toBe(62);
+        expect(starts).toBe(1);
+        await expect(readFile(controlLockPath(path, environment), "utf8")).rejects.toMatchObject({
+            code: "ENOENT",
+        });
     } finally {
         await rm(directory, { recursive: true, force: true });
     }
 });
 
-test("bounds a hanging injected pane opener by the shared readiness deadline", async () => {
-    const directory = await temporaryDirectory();
-    vi.useFakeTimers();
-    try {
-        const path = join(directory, "control.sock");
-        const opening = Promise.withResolvers<void>();
-        const never = Promise.withResolvers<void>();
-        const execution = runHook({
-            control: controlFor(path, unavailable),
-            environment: hookEnvironment(),
-            openPane: async () => {
-                opening.resolve();
-                await never.promise;
-            },
-        });
-
-        await opening.promise;
-        vi.advanceTimersByTime(1_500);
-        await expect(execution).rejects.toMatchObject({
-            _tag: "HookStartupError",
-            operation: "readiness",
-        });
-        await expect(readFile(`${path}.lock`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    } finally {
-        vi.useRealTimers();
-        await rm(directory, { recursive: true, force: true });
-    }
-});
-test("surfaces pane command failures without leaving its lock behind", async () => {
+test("cancels only the daemon it spawned when readiness times out", async () => {
     const directory = await temporaryDirectory();
     try {
         const path = join(directory, "control.sock");
-        const control = controlFor(path, unavailable);
+        const environment = hookEnvironmentFor(directory);
+        let now = 0;
+        let starts = 0;
+        let kills = 0;
+        let notifications = 0;
 
         await expect(
             runHook({
-                control,
-                environment: hookEnvironment(),
-                openPane: async () => {
-                    throw new HookStartupError("open_pane", "herdr failed");
+                control: controlFor(path, async () => {
+                    notifications += 1;
+                }),
+                environment,
+                now: () => now,
+                sleep: async (milliseconds) => {
+                    now += milliseconds;
+                },
+                spawnDaemon: () => {
+                    starts += 1;
+                    return daemonFor({
+                        kill: () => {
+                            kills += 1;
+                        },
+                    });
                 },
             }),
-        ).rejects.toThrow("herdr failed");
-        await expect(readFile(`${path}.lock`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+        ).rejects.toMatchObject({ _tag: "HookStartupError", operation: "readiness" });
+        expect(starts).toBe(1);
+        expect(kills).toBe(1);
+        expect(notifications).toBe(0);
+        await expect(readFile(controlLockPath(path, environment), "utf8")).rejects.toMatchObject({
+            code: "ENOENT",
+        });
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("reports a daemon that exits before readiness without publishing a hint", async () => {
+    const directory = await temporaryDirectory();
+    try {
+        const path = join(directory, "control.sock");
+        let notifications = 0;
+
+        await expect(
+            runHook({
+                control: controlFor(path, async () => {
+                    notifications += 1;
+                }),
+                environment: hookEnvironmentFor(directory),
+                spawnDaemon: () => daemonFor({ exit: Promise.resolve(3) }),
+            }),
+        ).rejects.toMatchObject({
+            _tag: "HookStartupError",
+            operation: "readiness",
+            message: expect.stringContaining("exited with code 3"),
+        });
+        expect(notifications).toBe(0);
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("fails before spawning when the daemon log destination is unavailable", async () => {
+    const directory = await temporaryDirectory();
+    try {
+        const path = join(directory, "control.sock");
+        const environment = hookEnvironmentFor(directory);
+        const blocker = join(directory, "blocked");
+        await writeFile(blocker, "not a directory");
+        let starts = 0;
+
+        await expect(
+            runHook({
+                control: controlFor(path, unavailable),
+                environment,
+                log: {
+                    path: () => join(blocker, "logs", "daemon.log"),
+                    preflight: preflightDaemonLog,
+                },
+                spawnDaemon: spawnFor(() => {
+                    starts += 1;
+                }),
+            }),
+        ).rejects.toMatchObject({ _tag: "HookStartupError", operation: "log" });
+        expect(starts).toBe(0);
+        await expect(readFile(controlLockPath(path, environment), "utf8")).rejects.toMatchObject({
+            code: "ENOENT",
+        });
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("surfaces daemon spawn failures without leaving its lock behind", async () => {
+    const directory = await temporaryDirectory();
+    try {
+        const path = join(directory, "control.sock");
+        const environment = hookEnvironmentFor(directory);
+        const failure = new HookStartupError("spawn", "daemon spawn failed");
+
+        await expect(
+            runHook({
+                control: controlFor(path, unavailable),
+                environment,
+                spawnDaemon: () => {
+                    throw failure;
+                },
+            }),
+        ).rejects.toBe(failure);
+        await expect(readFile(controlLockPath(path, environment), "utf8")).rejects.toMatchObject({
+            code: "ENOENT",
+        });
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("starts one daemon for start and reports the same instance afterwards", async () => {
+    const directory = await temporaryDirectory();
+    try {
+        const path = join(directory, "control.sock");
+        // No hook payload at all: an explicit start never needs one.
+        const environment: NodeJS.ProcessEnv = {
+            LOCALAPPDATA: directory,
+            USERPROFILE: directory,
+        };
+        let ready = false;
+        let starts = 0;
+        const control = controlFor(path, unavailable, undefined, undefined, async (target) => {
+            if (!ready) {
+                throw new ControlUnavailable(target, "connect");
+            }
+            return daemonHealth();
+        });
+
+        const started = await ensureDaemon({
+            control,
+            environment,
+            spawnDaemon: () => {
+                starts += 1;
+                ready = true;
+                return daemonFor();
+            },
+        });
+        const reused = await ensureDaemon({
+            control,
+            environment,
+            spawnDaemon: () => {
+                starts += 1;
+                return daemonFor();
+            },
+        });
+
+        expect(started.status).toBe("started");
+        expect(reused.status).toBe("already_running");
+        expect(reused.daemon).toEqual(daemonHealth());
+        expect(starts).toBe(1);
     } finally {
         await rm(directory, { recursive: true, force: true });
     }

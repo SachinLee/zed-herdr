@@ -41,11 +41,15 @@ export const WorkspaceSnapshot = Schema.Struct({
 });
 export type WorkspaceSnapshot = Schema.Schema.Type<typeof WorkspaceSnapshot>;
 
+/** How a workspace candidate is converted into an editor project path. */
+export const ProjectMode = Schema.Literal("git-root", "directory");
+export type ProjectMode = Schema.Schema.Type<typeof ProjectMode>;
+
 export const WorkspaceProject = Schema.Struct({
     workspaceId: WorkspaceId,
     name: WorkspaceText,
     cwd: WorkspaceText,
-    gitRoot: WorkspaceText,
+    projectPath: WorkspaceText,
     source: Schema.Literal("worktree", "plugin"),
     isLinkedWorktree: Schema.Boolean,
 });
