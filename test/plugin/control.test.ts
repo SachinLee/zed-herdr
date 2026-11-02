@@ -102,7 +102,7 @@ const createOrphanedSocket = async (path: string): Promise<void> => {
 };
 
 const runControlCli = async (
-    command: "health" | "stop" | "toggle",
+    command: "health" | "hook" | "stop" | "toggle",
     environment: NodeJS.ProcessEnv,
 ): Promise<CliObservation> => {
     const originalLog = console.log;
@@ -358,6 +358,49 @@ test("buffers a control notification received before hint stream consumption", a
         await rm(directory, { force: true, recursive: true });
     }
 });
+
+test("hook CLI reports a skipped decode on stderr and stays silent when notified", async () => {
+    const directory = await makeTemporaryDirectory();
+    const herdrSocket = join(directory, "herdr.sock");
+    const environment = hookEnvironment(herdrSocket);
+    const path = controlSocketPath(environment);
+    const notifications: Array<HookNotification> = [];
+    let server: ControlServer | undefined;
+
+    try {
+        server = await startControlServer({
+            path,
+            paneId: null,
+            notifications: {
+                async publish(notification) {
+                    notifications.push(notification);
+                },
+            },
+        });
+
+        const notified = await runControlCli("hook", environment);
+        expect(notified.exitCode).toBeUndefined();
+        expect(notified.stderr).toEqual([]);
+        expect(notified.stdout).toEqual([]);
+        expect(notifications).toEqual([
+            Schema.decodeUnknownSync(HookNotification)({
+                workspaceId: "integration-workspace",
+                cwd: "/repo/integration",
+            }),
+        ]);
+
+        // No hook JSON at all: the decode skip is diagnostic but still exits 0.
+        const skipped = await runControlCli("hook", controlEnvironment(herdrSocket));
+        expect(skipped.exitCode).toBeUndefined();
+        expect(skipped.stdout).toEqual([]);
+        expect(skipped.stderr).toEqual(["zed-herdr hook skipped: missing_workspace_or_cwd"]);
+        expect(notifications).toHaveLength(1);
+    } finally {
+        await server?.close();
+        await rm(path, { force: true });
+        await rm(directory, { force: true, recursive: true });
+    }
+}, 3_000);
 
 test("stop CLI shuts down the matching daemon and reports an absent endpoint", async () => {
     const directory = await makeTemporaryDirectory();

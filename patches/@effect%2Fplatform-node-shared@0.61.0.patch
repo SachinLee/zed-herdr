@@ -1,0 +1,36 @@
+diff --git a/dist/cjs/internal/commandExecutor.js b/dist/cjs/internal/commandExecutor.js
+index 4ba67b41eff47b03f6af854bf2c651cd46793b61..916e802c989c0d61f0d3bc03c2aff8fee8d72e9c 100644
+--- a/dist/cjs/internal/commandExecutor.js
++++ b/dist/cjs/internal/commandExecutor.js
+@@ -49,6 +49,7 @@ const runCommand = fileSystem => command => {
+             stdio: [inputToStdioOption(command.stdin), outputToStdioOption(command.stdout), outputToStdioOption(command.stderr)],
+             cwd: Option.getOrElse(command.cwd, _Function.constUndefined),
+             shell: command.shell,
++            windowsHide: true,
+             env: {
+               ...process.env,
+               ...Object.fromEntries(command.env)
+diff --git a/dist/esm/internal/commandExecutor.js b/dist/esm/internal/commandExecutor.js
+index 0b60da66c81ca7b6d40f31d1f33b26d6d76a277e..75d7ea96c854fc10fdb1fe8518e9465ad42f804c 100644
+--- a/dist/esm/internal/commandExecutor.js
++++ b/dist/esm/internal/commandExecutor.js
+@@ -42,6 +42,7 @@ const runCommand = fileSystem => command => {
+             stdio: [inputToStdioOption(command.stdin), outputToStdioOption(command.stdout), outputToStdioOption(command.stderr)],
+             cwd: Option.getOrElse(command.cwd, constUndefined),
+             shell: command.shell,
++            windowsHide: true,
+             env: {
+               ...process.env,
+               ...Object.fromEntries(command.env)
+diff --git a/src/internal/commandExecutor.ts b/src/internal/commandExecutor.ts
+index a0cb175f517f1385bd017e0d9f9e391487380737..38609f5db5393bb762e7dd6d1622a775334c3394 100644
+--- a/src/internal/commandExecutor.ts
++++ b/src/internal/commandExecutor.ts
+@@ -68,6 +68,7 @@ const runCommand =
+                   ],
+                   cwd: Option.getOrElse(command.cwd, constUndefined),
+                   shell: command.shell,
++                  windowsHide: true,
+                   env: { ...process.env, ...Object.fromEntries(command.env) },
+                   detached: process.platform !== "win32"
+                 })

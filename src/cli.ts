@@ -48,7 +48,12 @@ const runPluginHook = (environment: NodeJS.ProcessEnv) =>
     }).pipe(
         Effect.matchEffect({
             onFailure: commandFailed,
-            onSuccess: () => Effect.void,
+            onSuccess: (result) =>
+                result._tag === "Skipped"
+                    ? Effect.sync(() => {
+                          console.error("zed-herdr hook skipped: missing_workspace_or_cwd");
+                      })
+                    : Effect.void,
         }),
     );
 

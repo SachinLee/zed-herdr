@@ -6,6 +6,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/TestClock";
@@ -37,7 +38,9 @@ interface ProcessPlan {
     readonly onStdoutChunk?: (chunk: Uint8Array) => void;
     readonly startError?: PlatformError.PlatformError;
     readonly stderr?: ReadonlyArray<Uint8Array>;
+    readonly stderrNever?: boolean;
     readonly stdout?: ReadonlyArray<Uint8Array>;
+    readonly stdoutNever?: boolean;
 }
 
 interface ExecutorHarness {
@@ -103,15 +106,21 @@ const makeExecutor = (plans: ReadonlyArray<ProcessPlan>): ExecutorHarness => {
                         kills.push(signal);
                         plan.onKill?.();
                     }),
-                stderr: Stream.fromIterable(plan.stderr ?? []),
+                stderr:
+                    plan.stderrNever === true
+                        ? Stream.never
+                        : Stream.fromIterable(plan.stderr ?? []),
                 stdin: Sink.drain,
-                stdout: Stream.fromIterable(plan.stdout ?? []).pipe(
-                    Stream.tap((chunk) =>
-                        Effect.sync(() => {
-                            plan.onStdoutChunk?.(chunk);
-                        }),
-                    ),
-                ),
+                stdout:
+                    plan.stdoutNever === true
+                        ? Stream.never
+                        : Stream.fromIterable(plan.stdout ?? []).pipe(
+                              Stream.tap((chunk) =>
+                                  Effect.sync(() => {
+                                      plan.onStdoutChunk?.(chunk);
+                                  }),
+                              ),
+                          ),
             } as unknown as CommandExecutor.Process;
             runningStates.push(() => running);
             return Effect.addFinalizer(() =>
@@ -283,6 +292,54 @@ test("kills and awaits the scoped process when the five-second timeout expires",
             )
             .pipe(Effect.provide(TestContext.TestContext)),
     );
+});
+
+test("bounds a command whose process exits while stdout or stderr stays open", async () => {
+    for (const plan of [{ stdoutNever: true }, { stderrNever: true }]) {
+        const harness = makeExecutor([{ exitCode: 0, ...plan }, {}]);
+
+        await Effect.runPromise(
+            makeZedEditorAdapter("/tools/zed")
+                .pipe(
+                    Effect.provideService(CommandExecutor.CommandExecutor, harness.executor),
+                    Effect.flatMap((adapter) =>
+                        Effect.gen(function* () {
+                            const fiber = yield* adapter
+                                .ensureProject(ALPHA)
+                                .pipe(Effect.either, Effect.fork);
+                            let polled = yield* Fiber.poll(fiber);
+                            let seconds = 0;
+                            while (Option.isNone(polled) && seconds < 10) {
+                                yield* Effect.yieldNow();
+                                yield* TestClock.adjust("1 second");
+                                yield* Effect.yieldNow();
+                                seconds += 1;
+                                polled = yield* Fiber.poll(fiber);
+                            }
+
+                            expect(Option.isSome(polled)).toBe(true);
+                            expect(seconds).toBeLessThanOrEqual(6);
+                            if (Option.isSome(polled) && Exit.isSuccess(polled.value)) {
+                                const outcome = polled.value.value;
+                                expect(outcome._tag).toBe("Left");
+                                if (outcome._tag === "Left") {
+                                    expect(outcome.left.operation).toBe("ensure_project");
+                                    expect(outcome.left.exitCode).toBeNull();
+                                    expect(outcome.left.message).toContain("timed out");
+                                }
+                            }
+                            expect(harness.kills).toEqual(["SIGKILL"]);
+                            expect(harness.runningStates[0]?.()).toBe(false);
+
+                            const retried = yield* adapter.ensureProject(ALPHA).pipe(Effect.either);
+                            expect(retried._tag).toBe("Right");
+                            expect(harness.calls).toHaveLength(2);
+                        }),
+                    ),
+                )
+                .pipe(Effect.provide(TestContext.TestContext)),
+        );
+    }
 });
 
 test("bounds incrementally drained stderr to its final 4096 bytes", async () => {

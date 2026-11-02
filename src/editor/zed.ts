@@ -106,6 +106,14 @@ const runCommand = (
                 .pipe(
                     Effect.mapError((error): CommandFailure => ({ _tag: "StartFailure", error })),
                 );
+            yield* Effect.addFinalizer(() =>
+                process.isRunning.pipe(
+                    Effect.catchAll(() => Effect.succeed(false)),
+                    Effect.flatMap((running) =>
+                        running ? process.kill("SIGKILL").pipe(Effect.ignore) : Effect.void,
+                    ),
+                ),
+            );
             const stderrFiber = yield* Stream.runForEach(process.stderr, (chunk) =>
                 Ref.update(stderrTail, (tail) => appendStderrTail(tail, chunk)),
             ).pipe(
@@ -117,33 +125,28 @@ const runCommand = (
                 Effect.mapError((error): CommandFailure => ({ _tag: "ProcessFailure", error })),
                 Effect.forkScoped,
             );
-            const exitCode = yield* process.exitCode.pipe(
-                Effect.mapError((error): CommandFailure => ({ _tag: "ProcessFailure", error })),
-                Effect.timeoutOption(commandTimeout),
-            );
-
-            if (Option.isNone(exitCode)) {
-                yield* process
-                    .kill("SIGKILL")
-                    .pipe(
-                        Effect.mapError(
-                            (error): CommandFailure => ({ _tag: "ProcessFailure", error }),
-                        ),
-                    );
+            // The deadline covers the exit and both stream drains, so an exited process
+            // that leaves a pipe open can never block the adapter indefinitely.
+            const settled = yield* Effect.gen(function* () {
+                const exitCode = yield* process.exitCode.pipe(
+                    Effect.mapError((error): CommandFailure => ({ _tag: "ProcessFailure", error })),
+                );
                 yield* Effect.all([Fiber.join(stdoutFiber), Fiber.join(stderrFiber)], {
                     concurrency: "unbounded",
                 });
+                return exitCode;
+            }).pipe(Effect.timeoutOption(commandTimeout));
+
+            if (Option.isNone(settled)) {
+                yield* process.kill("SIGKILL").pipe(Effect.ignore);
                 return yield* Effect.fail({
                     _tag: "Timeout",
                     stderr: yield* Ref.get(stderrTail),
                 } satisfies AttemptFailure);
             }
 
-            yield* Effect.all([Fiber.join(stdoutFiber), Fiber.join(stderrFiber)], {
-                concurrency: "unbounded",
-            });
             return {
-                exitCode: exitCode.value,
+                exitCode: settled.value,
                 stderr: yield* Ref.get(stderrTail),
             };
         }),

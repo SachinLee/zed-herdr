@@ -17,6 +17,9 @@
       },
     },
   },
+  "patchedDependencies": {
+    "@effect/platform-node-shared@0.61.0": "patches/@effect%2Fplatform-node-shared@0.61.0.patch",
+  },
   "packages": {
     "@effect/cluster": ["@effect/cluster@0.60.0", "", { "dependencies": { "kubernetes-types": "^1.30.0" }, "peerDependencies": { "@effect/platform": "^0.97.0", "@effect/rpc": "^0.76.0", "@effect/sql": "^0.52.0", "@effect/workflow": "^0.19.0", "effect": "^3.22.0" } }, "sha512-O98Qx8jzEBhizhV/nOiqkZx+b0kx0AB1FBX+AKJ8wR8XO5Le44jqFzBwhwcoOVRhKVr2wzp3OE+IthipCVh4Mg=="],
 
